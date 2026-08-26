@@ -42,6 +42,7 @@ jobs:
       #   --vcs-release   : creates the GitHub Release with notes from commits
       # NOTE: no --strict, because when the version was already released
       # (e.g. first push with tag v1.0.0 at HEAD) PSR would exit with code 2.
+      # NOTE: PSR v9 reads the token from GH_TOKEN (not GITHUB_TOKEN)
       - name: Semantic Release (bump + tag + release, no changelog)
         id: release
         run: |
@@ -52,7 +53,7 @@ jobs:
             --vcs-release \
             --skip-build
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # PSR CLI outputs: uses GITHUB_OUTPUT for the following steps
       - name: Set outputs

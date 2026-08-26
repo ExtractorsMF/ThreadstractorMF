@@ -76,7 +76,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.out.outputs.tag }}
-          files: dist/*
+          # explicit patterns: uv build drops a dist/.gitignore that a bare
+          # "dist/*" glob would upload as a bogus "default.gitignore" asset
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
 
       # --- PyPI (enable when publishing is wanted) ---
       # Requires: configuring "trusted publishing" at pypi.org

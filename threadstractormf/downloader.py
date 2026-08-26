@@ -75,7 +75,7 @@ def download_media(
     # We keep it simple: if dest name == username (or parent is username)
     # and media.type is known, create subfolder
     subfolder = None
-    if media.id.endswith("_profile"):
+    if media.id.endswith("_profile") and dest.name != "profile":
         subfolder = "profile"
     elif media.type == "video":
         # Only split if dest looks like a threads user root (contains username)

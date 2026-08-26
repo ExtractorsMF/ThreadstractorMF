@@ -14,6 +14,7 @@ post_id mapping: post.code if present else raw pk. Media.id = post_id / post_id_
 from __future__ import annotations
 
 import json
+import random
 import re
 from pathlib import Path
 from typing import Any
@@ -392,7 +393,10 @@ class ThreadsAPI:
                     }
                 )
             with sync_playwright() as p:
-                b = p.chromium.launch(headless=True, args=["--no-sandbox"])
+                b = p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+                )
                 ctx = b.new_context(
                     user_agent=(
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -452,7 +456,10 @@ class ThreadsAPI:
                 pass
 
         with sync_playwright() as p:
-            b = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            b = p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+                )
             ctx = b.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -467,23 +474,29 @@ class ThreadsAPI:
             page = ctx.new_page()
             page.on("response", _on_response)
             page.goto(f"https://www.threads.com/@{username}/media", wait_until="domcontentloaded")
-            page.wait_for_timeout(4000)
-            # scroll patiently: stop only after 3 consecutive rounds without
-            # new posts rendered (threads lazy-loads with delay)
+            # human-like jitter: fixed intervals look robotic to bot detection
+            initial_wait_ms = random.uniform(2800, 3600)
+            page.wait_for_timeout(initial_wait_ms)
+            # scroll patiently: stop only after 2 consecutive empty rounds
+            # (threads lazy-loads with delay; waits carry jitter for stealth)
             max_scrolls = 40
             seen_permalinks: set[str] = set()
             empty_rounds = 0
             prev_time_count = 0
+            data: list[dict[str, Any]] = []
             for _ in range(max_scrolls):
                 page.mouse.wheel(0, 4000)
-                page.wait_for_timeout(3000)
+                scroll_wait_ms = random.uniform(1350, 2250)
+                page.wait_for_timeout(scroll_wait_ms)
                 time_count = page.evaluate(
                     "() => document.querySelectorAll('time[datetime]').length"
                 )
                 if time_count == prev_time_count:
                     empty_rounds += 1
-                    if empty_rounds >= 3:
+                    if empty_rounds >= 2:
                         break
+                    # skip the heavy extraction when nothing new rendered
+                    continue
                 else:
                     empty_rounds = 0
                 prev_time_count = time_count
@@ -564,82 +577,9 @@ class ThreadsAPI:
                 # Strict filter: only posts whose permalink contains /@<target>/ (exact user)
                 target_lower = username.lower()
                 data = [d for d in data if f"/@{target_lower}/" in d["permalink"].lower()]
-                # For carousels that appear as all-images but are actually mixed,
-                # fetch detail via Playwright
-                for d in list(data):
-                    if d["media_urls"] and all(
-                        not u.lower().endswith(".mp4") for u in d["media_urls"]
-                    ):
-                        try:
-                            # Quick httpx check for video_versions in the post
-                            # detail (fast, no browser)
-                            try:
-                                resp = self._request_with_rate_limit("GET", d["permalink"])
-                                if '"video_versions"' not in resp.text:
-                                    continue
-                            except Exception:
-                                # If httpx fails, fall back to Playwright check
-                                m_code = __import__("re").search(r"/post/([^/?#]+)", d["permalink"])
-                                code = m_code.group(1) if m_code else ""
-                                has_video = page.evaluate(
-                                    """(code) => {
-                                        const html=document.documentElement.innerHTML;
-                                        const idx=html.indexOf(code);
-                                        if(idx===-1) return false;
-                                        return html.slice(Math.max(0,idx-5000), idx+10000)
-                                            .includes('video_versions');
-                                    }""",
-                                    code,
-                                )
-                                if not has_video:
-                                    continue
-                            page.goto(d["permalink"], wait_until="domcontentloaded")
-                            page.wait_for_timeout(2500)
-                            detail_urls = page.evaluate(r"""() => {
-                                const urls=[];
-                                document.querySelectorAll('img, video, source').forEach(el=>{
-                                    const s=el.src||el.srcset||"";
-                                    if(!s) return;
-                                    if(s.includes('t51.2885-19')) return;
-                                    if(s.includes('fbcdn')||s.includes('scontent')||s.includes('cdninstagram')||s.includes('.mp4')){
-                                        const first = s.split(',')[0].split(' ')[0].trim();
-                                        if(first) urls.push(first);
-                                    }
-                                });
-                                const html=document.documentElement.innerHTML;
-                                // NOTE: first object may have other keys before "url"
-                                const re = /"video_versions":\[([^\]]*)/g;
-                                let m2;
-                                while((m2=re.exec(html))!==null){
-                                    const um=m2[1].match(/"url":"([^"]+)"/);
-                                    if(!um) continue;
-                                    const u=um[1].replaceAll(/\\u0026/g,"&")
-                                        .replaceAll(/\\u0025/g,"%").replace(/\\\//g,"/");
-                                    if(u && !urls.includes(u)) urls.push(u);
-                                }
-                                return [...new Set(urls)];
-                            }""")
-                            vids = [u for u in detail_urls if u.lower().endswith(".mp4")]
-                            if vids:
-                                # Add the videos to this post's media
-                                combined = list(d["media_urls"])
-                                seen = set(combined)
-                                for u in vids:
-                                    if u not in seen:
-                                        seen.add(u)
-                                        combined.append(u)
-                                d["media_urls"] = combined[:10]
-                        except Exception:
-                            pass
-                # Return to media tab
-                try:
-                    page.goto(
-                        f"https://www.threads.com/@{username}/media",
-                        wait_until="domcontentloaded",
-                    )
-                    page.wait_for_timeout(2000)
-                except Exception:
-                    pass
+                # NOTE: videos are covered by the in-page global video map and the
+                # XHR response capture; per-post detail fetches were removed —
+                # post pages no longer serialize video_versions (Meta format change).
                 # deduplicate
                 new_posts = []
                 for d in data:

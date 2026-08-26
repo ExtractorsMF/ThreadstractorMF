@@ -156,6 +156,40 @@ def _parse_post_node(node: dict, fallback_username: str | None = None) -> Post |
         return None
 
 
+def _walk_xhr_videos(node: Any, found: dict[str, list[str]]) -> None:
+    """Recursively collect {post_code: [mp4 urls]} from threads site API JSON.
+
+    Post objects carry "code" plus video_versions at their own level or inside
+    carousel_media items; this walks arbitrary response trees.
+    """
+    if isinstance(node, dict):
+        code = node.get("code")
+        if isinstance(code, str):
+            urls: list[str] = []
+            vv = node.get("video_versions")
+            if isinstance(vv, list):
+                for v in vv:
+                    if isinstance(v, dict) and ".mp4" in (v.get("url") or ""):
+                        urls.append(str(v["url"]))
+            car = node.get("carousel_media")
+            if isinstance(car, list):
+                for item in car:
+                    if (
+                        isinstance(item, dict)
+                        and isinstance(item.get("video_versions"), list)
+                    ):
+                        for v in item["video_versions"]:
+                            if isinstance(v, dict) and ".mp4" in (v.get("url") or ""):
+                                urls.append(str(v["url"]))
+            if urls:
+                found[code].extend(urls)
+        for v in node.values():
+            _walk_xhr_videos(v, found)
+    elif isinstance(node, list):
+        for v in node:
+            _walk_xhr_videos(v, found)
+
+
 class ThreadsAPI:
     """Low-level client. Used by Threadscraper."""
 
@@ -376,6 +410,8 @@ class ThreadsAPI:
             return None
 
     def _fetch_posts_via_playwright(self, username: str, limit: int | None) -> list[Post]:
+        from collections import defaultdict
+
         from playwright.sync_api import sync_playwright
 
         pw = []
@@ -393,6 +429,23 @@ class ThreadsAPI:
             except Exception:
                 continue
         posts: list[Post] = []
+        # XHR capture: threads ships media JSON (incl video_versions) via its own
+        # api responses while scrolling; late posts are ONLY available here,
+        # never serialized into document HTML.
+        captured: list[Any] = []
+
+        def _on_response(resp: Any) -> None:
+            try:
+                ct = resp.headers.get("content-type", "")
+                if "json" not in ct:
+                    return
+                u = resp.url.lower()
+                if "graphql" not in u and "/api/" not in u:
+                    return
+                captured.append(resp.json())
+            except Exception:
+                pass
+
         with sync_playwright() as p:
             b = p.chromium.launch(headless=True, args=["--no-sandbox"])
             ctx = b.new_context(
@@ -407,16 +460,71 @@ class ThreadsAPI:
                 except Exception:
                     pass
             page = ctx.new_page()
+            page.on("response", _on_response)
             page.goto(f"https://www.threads.com/@{username}/media", wait_until="domcontentloaded")
             page.wait_for_timeout(4000)
-            # scroll up to limit or 30 like content.js
-            max_scrolls = 30
+            # scroll patiently: stop only after 3 consecutive rounds without
+            # new posts rendered (threads lazy-loads with delay)
+            max_scrolls = 40
             seen_permalinks: set[str] = set()
+            empty_rounds = 0
+            prev_time_count = 0
             for _ in range(max_scrolls):
-                page.mouse.wheel(0, 3500)
+                page.mouse.wheel(0, 4000)
                 page.wait_for_timeout(3000)
+                time_count = page.evaluate(
+                    "() => document.querySelectorAll('time[datetime]').length"
+                )
+                if time_count == prev_time_count:
+                    empty_rounds += 1
+                    if empty_rounds >= 3:
+                        break
+                else:
+                    empty_rounds = 0
+                prev_time_count = time_count
                 # check if new posts loaded
                 data = page.evaluate(r"""() => {
+                    const html = document.documentElement.innerHTML;
+                    // valid codes: only those appearing in real /post/ links
+                    // (filters false positives like "code":"en_US")
+                    const validCodes = new Set();
+                    document.querySelectorAll('a[href*="/post/"]').forEach(a=>{
+                        const m=a.href.match(/\/post\/([^\/?#]+)/);
+                        if(m) validCodes.add(m[1]);
+                    });
+                    // positions of every valid code occurrence in full html
+                    const codePositions=[];
+                    for(const m of html.matchAll(/"code":"([^"]+)"/g)){
+                        if(validCodes.has(m[1])) codePositions.push({code:m[1], idx:m.index});
+                    }
+                    codePositions.sort((a,b)=>a.idx-b.idx);
+                    // GLOBAL video map: every non-empty video_versions array is
+                    // assigned to the nearest valid code AFTER it in the html.
+                    // (empirically each post's media JSON follows its code; a fixed
+                    // window around the first occurrence misses carousels/videos)
+                    const codeVideos={};
+                    const seenBase=new Set();
+                    for(const m of html.matchAll(/"video_versions":\[([^\]]*)\]/g)){
+                        if(!m[1].trim()) continue;
+                        const um=m[1].match(/"url":"([^"]+)"/);
+                        if(!um) continue;
+                        const u=um[1].replaceAll(/\\u0026/g,"&")
+                            .replaceAll(/\\u0025/g,"%").replace(/\\\//g,"/");
+                        if(!u.includes('.mp4')) continue;
+                        const base=u.split('?')[0];
+                        if(seenBase.has(base)) continue;
+                        seenBase.add(base);
+                        let owner=null;
+                        for(const cp of codePositions){
+                            if(cp.idx>=m.index && cp.idx-m.index<=80000){ owner=cp.code; break; }
+                        }
+                        if(!owner && codePositions.length){
+                            owner=codePositions[codePositions.length-1].code;
+                        }
+                        if(owner){
+                            (codeVideos[owner]=codeVideos[owner]||[]).push(u);
+                        }
+                    }
                     const posts=[];
                     document.querySelectorAll('time[datetime]').forEach(t=>{
                         const a=t.closest('a[href*="/post/"]');
@@ -425,8 +533,8 @@ class ThreadsAPI:
                         const dt=t.getAttribute('datetime');
                         let container=t;
                         let media_urls=[];
-                        let raw_html="";
                         let postCode = (permalink.match(/\/post\/([^/?#]+)/) || [])[1] || "";
+                        // poster extraction per container (images + visible posters)
                         for(let i=0;i<10 && media_urls.length==0;i++){
                             let els=[...container.querySelectorAll('img, video, source')];
                             media_urls=els.filter(el=>{
@@ -436,42 +544,13 @@ class ThreadsAPI:
                                 return s.includes('fbcdn')||s.includes('scontent')
                                     ||s.includes('cdninstagram')||s.includes('.mp4');
                             }).map(el=>el.src||el.srcset.split(' ')[0]);
-                            raw_html = container.innerHTML;
-                            // Always also scan for video_versions in this container's HTML
-                            const re2 = /"video_versions":\s*\[\s*\{"url":"([^"]+)"/g;
-                            let m2;
-                            while((m2=re2.exec(raw_html))!==null){
-                                const u=m2[1].replaceAll(/\\u0026/g,"&").replaceAll(/\\u0025/g,"%");
-                                if(u && !media_urls.includes(u)) media_urls.push(u);
-                            }
                             if(media_urls.length>0) break;
                             container=container.parentElement;
                             if(!container) break;
                         }
-                        // Final fallback: look in the whole document for this post's
-                        // code's video_versions (grid shows poster jpgs for videos,
-                        // the mp4 is in the post's JSON elsewhere)
-                        if(postCode){
-                            const fullHtml=document.documentElement.innerHTML;
-                            const idx=fullHtml.indexOf(postCode);
-                            if(idx!==-1){
-                                const snippet=fullHtml.slice(Math.max(0,idx-8000), idx+12000);
-                                const re3 = /"video_versions":\s*\[\s*\{"url":"([^"]+)"/g;
-                                let m3;
-                                while((m3=re3.exec(snippet))!==null){
-                                    const u=m3[1].replaceAll(/\\u0026/g,"&")
-                                        .replaceAll(/\\u0025/g,"%");
-                                    if(u && !media_urls.includes(u)) media_urls.push(u);
-                                }
-                            }
-                        }
-                        if(media_urls.length===0 && raw_html){
-                            const re = /"video_versions":\s*\[\s*\{"url":"([^"]+)"/g;
-                            let m;
-                            while((m=re.exec(raw_html))!==null){
-                                const u=m[1].replaceAll(/\\u0026/g,"&").replaceAll(/\\u0025/g,"%");
-                                if(u) media_urls.push(u);
-                            }
+                        // merge globally-mapped video urls for this post
+                        if(postCode && codeVideos[postCode]){
+                            for(const u of codeVideos[postCode]) media_urls.push(u);
                         }
                         posts.push({permalink, datetime:dt, media_urls: [...new Set(media_urls)]});
                     });
@@ -523,11 +602,14 @@ class ThreadsAPI:
                                     }
                                 });
                                 const html=document.documentElement.innerHTML;
-                                const re = /"video_versions":\s*\[\s*\{"url":"([^"]+)"/g;
+                                // NOTE: first object may have other keys before "url"
+                                const re = /"video_versions":\[([^\]]*)/g;
                                 let m2;
                                 while((m2=re.exec(html))!==null){
-                                    const u=m2[1].replaceAll(/\\u0026/g,"&")
-                                        .replaceAll(/\\u0025/g,"%");
+                                    const um=m2[1].match(/"url":"([^"]+)"/);
+                                    if(!um) continue;
+                                    const u=um[1].replaceAll(/\\u0026/g,"&")
+                                        .replaceAll(/\\u0025/g,"%").replace(/\\\//g,"/");
                                     if(u && !urls.includes(u)) urls.push(u);
                                 }
                                 return [...new Set(urls)];
@@ -596,13 +678,39 @@ class ThreadsAPI:
                         break
                 if limit is not None and len(posts) >= limit:
                     break
-                if len(new_posts) == 0:
-                    # no new
-                    break
+                # NOTE: no early break on empty rounds here — the scroll loop
+                # already stops after 3 consecutive rounds without new renders
             b.close()
+        # merge XHR-captured videos into converted posts (late posts only exist
+        # here — their media JSON is never serialized into document HTML)
+        xhr_map: dict[str, list[str]] = defaultdict(list)
+        for j in captured:
+            _walk_xhr_videos(j, xhr_map)
+        for post in posts:
+            extra = xhr_map.get(post.id, [])
+            if not extra:
+                continue
+            existing = {m.url.split("?")[0] for m in post.media}
+            for u in extra:
+                base = u.split("?")[0]
+                if base in existing:
+                    continue
+                existing.add(base)
+                ext = _guess_ext(u)
+                idx_next = len(post.media) + 1
+                post.media.append(
+                    Media(
+                        id=f"{post.id}_{idx_next}",
+                        post_id=post.id,
+                        index=idx_next,
+                        type="video" if ext == "mp4" else "image",
+                        url=u,
+                        ext=ext,
+                    )
+                )
         if limit is not None:
             posts = posts[:limit]
-        # filtro reposts ya implicito por username == target (DOM already)
+        # repost filter already implicit: username == target (DOM filtered)
         return posts
 
     def get_posts(

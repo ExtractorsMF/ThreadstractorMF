@@ -1,6 +1,6 @@
 [project]
 name = "threadstractormf"
-version = "1.0.1"
+version = "1.0.2"
 description = "Python library for Threads - media download by post_id with Netscape cookies auth (gallery-dl compatible)"
 readme = "README.md"
 requires-python = ">=3.10"

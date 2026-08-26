@@ -26,7 +26,8 @@ dependencies = [
 
 [project.optional-dependencies]
 antibot = ["curl_cffi>=0.7"]
-browser = ["playwright>=1.43"]
+# browser-cookie3 is required by auth.load_from_browser (--cookies-from-browser)
+browser = ["playwright>=1.43", "browser-cookie3>=0.20"]
 dev = [
   "pytest>=8",
   "respx>=0.22",

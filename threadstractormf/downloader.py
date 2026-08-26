@@ -128,7 +128,10 @@ def download_media(
 
     close_client = False
     if client is None:
-        client = httpx.Client(follow_redirects=True, timeout=60, http2=True)
+        # fine-grained: fail fast on dead CDNs (connect 5s) but tolerate
+        # slow-yet-active transfers (read timeout is per-chunk, not total)
+        cdn_timeout = httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0)
+        client = httpx.Client(follow_redirects=True, timeout=cdn_timeout, http2=True)
         close_client = True
     try:
         # Browser-like headers: video endpoints (/v/t65.*) reject python-httpx UA with 403

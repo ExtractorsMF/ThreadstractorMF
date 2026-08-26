@@ -26,7 +26,7 @@ class Threadscraper:
         cookies: str | Path | httpx.Cookies | Any,
         *,
         impersonate: str | None = None,
-        timeout: float = 30.0,
+        timeout: float = 15.0,
         rate_limit: bool = True,
         cooldown_ms: int = 2000,
         cooldown_after_100_ms: int = 120000,

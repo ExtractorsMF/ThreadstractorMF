@@ -198,7 +198,7 @@ class ThreadsAPI:
         cookies: httpx.Cookies | Any | str | Path,
         *,
         impersonate: str | None = None,
-        timeout: float = 30.0,
+        timeout: float = 15.0,
         rate_limit_config: RateLimitConfig | None = None,
     ):
 
@@ -237,10 +237,15 @@ class ThreadsAPI:
     def _get_client(self) -> httpx.Client:
         if self._client:
             return self._client
+        # fine-grained: connect fast-fails at 5s; read uses the public
+        # `timeout` param (per-chunk, so slow-but-active responses survive)
+        site_timeout = httpx.Timeout(
+            connect=5.0, read=self.timeout, write=10.0, pool=5.0
+        )
         self._client = httpx.Client(
             cookies=self.cookies,
             headers=self._headers(),
-            timeout=self.timeout,
+            timeout=site_timeout,
             follow_redirects=True,
             http2=True,
         )

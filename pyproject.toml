@@ -1,0 +1,97 @@
+[project]
+name = "threadstractormf"
+version = "1.0.0"
+description = "Python library for Threads - media download by post_id with Netscape cookies auth (gallery-dl compatible)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-only" }
+authors = [{ name = "ExtractorsMF" }]
+keywords = ["threads", "scraper", "downloader", "gallery-dl", "yt-dlp"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.14",
+  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+  "Intended Audience :: Developers",
+  "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = [
+  "httpx[http2]>=0.27",
+  "pydantic>=2.6",
+  "typer>=0.12",
+  "rich>=13",
+]
+
+[project.optional-dependencies]
+antibot = ["curl_cffi>=0.7"]
+browser = ["playwright>=1.43"]
+dev = [
+  "pytest>=8",
+  "respx>=0.22",
+  "ruff>=0.8",
+  "mypy>=1.10",
+  "python-semantic-release>=9,<10",
+  # pin temporal: 3.1.60 elimino Actor.name_email_regex que PSR usa (bug upstream)
+  "gitpython<3.1.60",
+]
+
+[project.urls]
+Homepage = "https://github.com/ExtractorsMF/ThreadstractorMF"
+Repository = "https://github.com/ExtractorsMF/ThreadstractorMF"
+
+[project.scripts]
+threadstractormf = "threadstractormf.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["threadstractormf"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "C4", "UP"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+# B008 is the idiomatic Typer pattern (function-call in defaults)
+"threadstractormf/cli.py" = ["B008"]
+"scripts/sniff.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+strict = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.semantic_release]
+# Conventional commits: feat->minor, fix/perf->patch, feat!/BREAKING CHANGE->major
+version_toml = ["pyproject.toml:project.version"]
+version_variables = ["threadstractormf/__init__.py:__version__"]
+tag_format = "v{version}"
+commit_parser = "conventional"
+# NOTE: without previous tags PSR starts from 0.0.0. We create the v1.0.0 tag manually
+# on the first push so PSR continues from there (see release instructions).
+
+[tool.semantic_release.branches.main]
+match = "main"
+prerelease = false
+
+[tool.semantic_release.commit_parser_options]
+# these commit types count as minor even on 0.x
+minor_tags = ["feat"]
+patch_tags = ["fix", "perf", "refactor"]
+
+[tool.semantic_release.remote]
+type = "github"

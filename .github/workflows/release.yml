@@ -1,0 +1,86 @@
+name: Release
+
+# python-semantic-release: analyzes conventional commits on main.
+# feat -> minor | fix/perf -> patch | feat!/BREAKING CHANGE -> major
+# If there are no new relevant commits, it does nothing (released=false).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write # commit de version + tag + GitHub Release
+
+jobs:
+  release:
+    name: Semantic Release
+    runs-on: ubuntu-latest
+    concurrency:
+      group: semantic-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # PSR needs full history for commit analysis
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync dependencies
+        run: uv sync --all-extras
+
+      - name: Configure git (bot identity for the version commit)
+        run: |
+          git config user.name "semantic-release-bot"
+          git config user.email "semantic-release-bot@users.noreply.github.com"
+
+      # PSR invoked directly with explicit flags:
+      #   --no-changelog  : this project has NO CHANGELOG.md
+      #   --push          : pushes commit + tag
+      #   --vcs-release   : creates the GitHub Release with notes from commits
+      # NOTE: no --strict, because when the version was already released
+      # (e.g. first push with tag v1.0.0 at HEAD) PSR would exit with code 2.
+      - name: Semantic Release (bump + tag + release, no changelog)
+        id: release
+        run: |
+          uv run semantic-release \
+            version \
+            --no-changelog \
+            --commit --tag --push \
+            --vcs-release \
+            --skip-build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # PSR CLI outputs: uses GITHUB_OUTPUT for the following steps
+      - name: Set outputs
+        if: always()
+        id: out
+        run: |
+          if git describe --exact-match --tags HEAD 2>/dev/null; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$(git describe --exact-match --tags HEAD)" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build distributions
+        if: steps.out.outputs.released == 'true'
+        run: uv build
+
+      - name: Attach wheel + sdist to GitHub Release
+        if: steps.out.outputs.released == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.out.outputs.tag }}
+          files: dist/*
+
+      # --- PyPI (enable when publishing is wanted) ---
+      # Requires: configuring "trusted publishing" at pypi.org
+      # (Projects -> Manage -> Publishing -> GitHub, workflow "release.yml").
+      #
+      # - name: Publish to PyPI
+      #   if: steps.out.outputs.released == 'true'
+      #   uses: pypa/gh-action-pypi-publish@release/v1

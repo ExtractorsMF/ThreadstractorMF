@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+# cookies / secrets
+cookies.txt
+*cookies*.txt
+scripts/sniff_log.json
+scripts/*_requests*.json
+# OS
+.DS_Store
+Thumbs.db
+# IDE
+.vscode/
+.idea/

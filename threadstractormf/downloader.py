@@ -51,6 +51,35 @@ def is_valid_media_url(url: str) -> bool:
         return False
 
 
+def _is_transient_error(exc: BaseException) -> bool:
+    """True when a download error is worth retrying (flaky networks).
+
+    Covers DNS hiccups ([Errno -3] gaierror), connect/read timeouts and CDN
+    5xx responses. Permanent errors (invalid URL, 4xx) return False.
+    """
+    if isinstance(exc, httpx.TransportError):
+        # ConnectError (wraps gaierror/[Errno -3]), ConnectTimeout,
+        # ReadTimeout, RemoteProtocolError, etc.
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return 500 <= exc.response.status_code < 600
+    if isinstance(exc, OSError):
+        import errno as _errno
+
+        return exc.errno in (-3, _errno.EAI_AGAIN)
+    return False
+
+
+# Retry policy for transient network errors (DNS resolution flaps, timeouts,
+# CDN hiccups). Extra attempts give the resolver/network time to recover.
+_DOWNLOAD_ATTEMPTS = 3
+_DOWNLOAD_BACKOFF_S = (2.0, 5.0)
+
+# Generous CDN timeouts: slow-yet-active transfers stay alive (read timeout is
+# per-chunk, not total) and DNS/TLS setup gets breathing room on bad networks.
+_CDN_TIMEOUT = httpx.Timeout(connect=15.0, read=45.0, write=45.0, pool=30.0)
+
+
 def download_media(
     media: Media,
     dest: str | Path,
@@ -128,31 +157,57 @@ def download_media(
 
     close_client = False
     if client is None:
-        # fine-grained: fail fast on dead CDNs (connect 5s) but tolerate
-        # slow-yet-active transfers (read timeout is per-chunk, not total)
-        cdn_timeout = httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0)
-        client = httpx.Client(follow_redirects=True, timeout=cdn_timeout, http2=True)
+        client = httpx.Client(follow_redirects=True, timeout=_CDN_TIMEOUT, http2=True)
         close_client = True
+
+    # Browser-like headers: video endpoints (/v/t65.*) reject python-httpx UA with 403
+    cdn_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.threads.net/",
+    }
+
+    # Retry loop for transient network errors; writes go to a .part temp file
+    # so a failed attempt never leaves a truncated media at the final path.
+    import sys
+    import time as _time
+
+    tmp = out.with_name(out.name + ".part")
+    last_exc: BaseException | None = None
     try:
-        # Browser-like headers: video endpoints (/v/t65.*) reject python-httpx UA with 403
-        cdn_headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-            ),
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.threads.net/",
-        }
-        with client.stream("GET", media.url, headers=cdn_headers) as r:
-            r.raise_for_status()
-            with out.open("wb") as f:
-                for chunk in r.iter_bytes(chunk_size=8192):
-                    f.write(chunk)
+        for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+            try:
+                with client.stream("GET", media.url, headers=cdn_headers) as r:
+                    r.raise_for_status()
+                    with tmp.open("wb") as f:
+                        for chunk in r.iter_bytes(chunk_size=8192):
+                            f.write(chunk)
+                tmp.replace(out)
+                return out
+            except Exception as e:
+                last_exc = e
+                tmp.unlink(missing_ok=True)
+                if attempt < _DOWNLOAD_ATTEMPTS and _is_transient_error(e):
+                    wait_s = _DOWNLOAD_BACKOFF_S[
+                        min(attempt - 1, len(_DOWNLOAD_BACKOFF_S) - 1)
+                    ]
+                    print(
+                        f"  {media.id} retrying ({attempt}/{_DOWNLOAD_ATTEMPTS - 1}) after "
+                        f"{wait_s:.0f}s: {e}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    _time.sleep(wait_s)
+                    continue
+                raise
+        raise RuntimeError("download loop exited without result") from last_exc
     finally:
         if close_client:
             client.close()
-    return out
 
 
 def download_profile_pic(

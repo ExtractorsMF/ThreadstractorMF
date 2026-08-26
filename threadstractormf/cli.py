@@ -12,6 +12,7 @@ app = typer.Typer(
     help="threadstractormf — Threads downloader (post_id naming, gallery-dl cookies)",
 )
 console = Console()
+err_console = Console(stderr=True)
 
 
 @app.command()
@@ -152,9 +153,12 @@ def main(
                     )
                     console.print(f"  {media.id} -> {out}")
                 except Exception as e:
-                    # un media fallido (URL firmada expirada, 403 CDN, etc.)
-                    # must not abort the whole batch
-                    console.print(f"[yellow]  {media.id} failed: {e}[/yellow]")
+                    # un media fallido (URL firmada expirada, 403 CDN, red)
+                    # must not abort the whole batch. Failures go to STDERR
+                    # (stdout is the "one line per downloaded file" contract
+                    # with orchestrators like scrapmf — a failed line there
+                    # would be miscounted as a successful download).
+                    err_console.print(f"[yellow]  {media.id} failed: {e}[/yellow]")
     except NotImplementedError as e:
         console.print(f"[yellow]{e}[/yellow]")
         console.print(

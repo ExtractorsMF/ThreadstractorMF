@@ -25,6 +25,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Optional: TLS/JA4 impersonation for --impersonate (Meta's WAF inspects the
+# TLS handshake; curl_cffi reproduces Chrome's byte-for-byte, like yt-dlp).
 antibot = ["curl_cffi>=0.7"]
 # browser-cookie3 is required by auth.load_from_browser (--cookies-from-browser)
 browser = ["playwright>=1.43", "browser-cookie3>=0.20"]

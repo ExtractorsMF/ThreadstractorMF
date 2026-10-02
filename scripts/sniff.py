@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 try:
     from playwright.sync_api import sync_playwright
@@ -43,6 +44,7 @@ def main(
 
     # Load Netscape cookies via threadstractormf.auth
     # (tolerates spaces, HttpOnly, scrapmf-source)
+    from threadstractormf._backend import to_playwright_cookies
     from threadstractormf.auth import load_netscape_cookies
 
     try:
@@ -53,22 +55,7 @@ def main(
 
         jar = http.cookiejar.MozillaCookieJar(str(cookies))
         jar.load(ignore_discard=True, ignore_expires=True)
-    pw_cookies = []
-    for c in jar:
-        try:
-            domain = c.domain.lstrip(".") if hasattr(c, "domain") else "threads.net"
-            pw_cookies.append(
-                {
-                    "name": c.name,
-                    "value": c.value,
-                    "domain": domain,
-                    "path": getattr(c, "path", "/"),
-                    "secure": bool(getattr(c, "secure", True)),
-                    "httpOnly": False,
-                }
-            )
-        except Exception:
-            continue
+    pw_cookies = to_playwright_cookies(jar)
     threads_count = sum(1 for c in jar if "threads" in getattr(c, "domain", ""))
     print(
         f"[INFO] cookies loaded: {len(pw_cookies)} (of {len(list(jar))} in jar). "
@@ -90,7 +77,7 @@ def main(
         )
         if pw_cookies:
             try:
-                ctx.add_cookies(pw_cookies)
+                ctx.add_cookies(cast("Any", pw_cookies))
             except Exception as e:
                 print(f"[WARN] add_cookies failed: {e}")
         page = ctx.new_page()

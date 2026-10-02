@@ -15,9 +15,24 @@ from typing import Any
 import httpx
 
 from threadstractormf.api import ThreadsAPI
-from threadstractormf.auth import load_netscape_cookies
+from threadstractormf.archive import DownloadLedger, ledger_path_for
+from threadstractormf.auth import load_cookies_dict, load_netscape_cookies
 from threadstractormf.downloader import download_media, download_profile_pic
 from threadstractormf.models import Media, Post, Profile
+
+
+def _coerce_cookies(cookies: str | Path | dict[str, str] | httpx.Cookies | Any) -> Any:
+    """Normalise every accepted ``cookies`` input into a CookieJar.
+
+    A plain dict was previously stored as-is: ``get_csrf_token`` still worked
+    through its fallback, but the Playwright path received a mapping where it
+    expected Cookie objects and produced an *empty* cookie list, so the DOM
+    scraper ran with no session at all. Normalising here means one shape for
+    every consumer.
+    """
+    if isinstance(cookies, dict):
+        return load_cookies_dict(cookies, domain=".threads.net")
+    return cookies
 
 
 class Threadscraper:
@@ -31,10 +46,19 @@ class Threadscraper:
         cooldown_ms: int = 2000,
         cooldown_after_100_ms: int = 120000,
         rps: float = 0.5,
+        archive: bool = True,
     ):
         if isinstance(cookies, (str, Path)):
             cookies = load_netscape_cookies(cookies)
+        cookies = _coerce_cookies(cookies)
         self.cookies = cookies
+        # Kept so downloads use the same TLS fingerprint as the API calls:
+        # a WAF that blocks the GraphQL call also blocks the CDN fetches.
+        self.impersonate = impersonate
+        # Download ledger, keyed by (post_id, index) so a corrected extension or
+        # a different filename template never re-downloads an existing archive.
+        self.archive = archive
+        self._ledgers: dict[str, DownloadLedger] = {}
         from threadstractormf.rate_limit import BatchCooldownLimiter, RateLimitConfig
 
         self.rate_limit = rate_limit
@@ -73,17 +97,37 @@ class Threadscraper:
         filename_template: str | None = None,
         username: str | None = None,
         date_iso: str | None = None,
+        adopt_existing: bool = True,
     ) -> Path:
         return download_media(
             media,
             dest,
             overwrite=overwrite,
+            impersonate=self.impersonate,
             limiter=self.download_limiter,
             rate_limit=self.rate_limit,
             filename_template=filename_template,
             username=username,
             date_iso=date_iso,
+            ledger=self._ledger_for(dest),
+            adopt_existing=adopt_existing,
         )
+
+    def _ledger_for(self, dest: str | Path) -> DownloadLedger | None:
+        """Ledger covering ``dest``, or None when archiving is disabled.
+
+        One ledger per destination root — not per photos/ videos/ subdirectory —
+        created and loaded on first use.
+        """
+        if not self.archive:
+            return None
+        key = str(Path(dest).expanduser().resolve())
+        ledger = self._ledgers.get(key)
+        if ledger is None:
+            ledger = DownloadLedger(ledger_path_for(key))
+            ledger.load()
+            self._ledgers[key] = ledger
+        return ledger
 
     def download_many(
         self,
@@ -93,11 +137,15 @@ class Threadscraper:
         overwrite: bool = False,
         filename_template: str | None = None,
         username: str | None = None,
+        date_iso: str | None = None,
     ) -> list[Path]:
-        """Download a list with built-in anti rate-limit protection."""
+        """Download a list with built-in anti rate-limit protection.
+
+        ``date_iso`` is passed through to the template: without it a
+        ``{date:...}`` filename stamped every file with the current date.
+        """
         out: list[Path] = []
         for m in medias:
-            # if username not passed, could infer from media.post_id? better explicit
             out.append(
                 self.download(
                     m,
@@ -105,6 +153,7 @@ class Threadscraper:
                     overwrite=overwrite,
                     filename_template=filename_template,
                     username=username,
+                    date_iso=date_iso,
                 )
             )
         return out
@@ -119,9 +168,11 @@ class Threadscraper:
             profile.profile_pic_url,
             username,
             dest,
+            impersonate=self.impersonate,
             limiter=self.download_limiter,
             rate_limit=self.rate_limit,
             filename_template=filename_template,
+            ledger=self._ledger_for(dest),
         )
 
     def close(self) -> None:

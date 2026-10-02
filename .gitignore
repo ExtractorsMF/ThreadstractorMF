@@ -16,6 +16,9 @@ cookies.txt
 *cookies*.txt
 scripts/sniff_log.json
 scripts/*_requests*.json
+# Frozen pre-refactor cookie loader, used as the oracle in
+# tests/test_cookie_loading.py. Not part of the package.
+.old_auth_for_tests.py
 # OS
 .DS_Store
 Thumbs.db

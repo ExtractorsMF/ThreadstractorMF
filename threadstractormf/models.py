@@ -11,7 +11,6 @@ Library:
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -89,14 +88,18 @@ class Post(BaseModel):
 
 
 class Profile(BaseModel):
+    """What ``get_profile`` can actually resolve today.
+
+    Only fields the scraper fills in are declared: a field that always came back
+    ``None`` would be an API promise the library cannot keep. Bio, follower count
+    and privacy state are available in the page HTML but not parsed yet; add
+    them here together with the extractor that populates them.
+    """
+
     username: str
     user_id: str | None = None
-    full_name: str | None = None
-    bio: str | None = None
     profile_pic_url: str | None = None
     profile_pic_media: Media | None = None
-    is_private: bool = False
-    follower_count: int | None = None
 
 
 # Helpers portados de background.js
@@ -118,18 +121,3 @@ def sanitize_filename(name: str) -> str:
     s = re.sub(r"_+", "_", s)
     s = s.strip("_")
     return s[:100]
-
-
-def format_datetime_to_filename(iso: str | None) -> str | None:
-    """Port of background.js:21-38 formatDatetime (YYYY-MM-DD_HH-M-S).
-    Used for metadata only, not for post_id filenames."""
-    if not iso:
-        return None
-    try:
-        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return (
-            f"{dt.year}-{dt.month:02d}-{dt.day:02d}_"
-            f"{dt.hour:02d}-{dt.minute:02d}-{dt.second:02d}"
-        )
-    except Exception:
-        return None

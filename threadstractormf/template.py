@@ -11,6 +11,8 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
+from threadstractormf.models import sanitize_filename
+
 
 def render_filename(
     template: str,
@@ -95,11 +97,23 @@ def render_directory(
         parts = [template_parts]
     else:
         parts = template_parts
+    # {username} comes from the CLI target, which the user types. It must be
+    # reduced to a single harmless path component: otherwise
+    # `--directory-template "{username}"` with the target `@..` resolves the
+    # destination to the parent of --dest, and files land outside it silently.
+    #
+    # sanitize_filename is reused rather than a second filter being written, so
+    # "untrusted text" has one definition in this package. It maps ".." and "."
+    # to "", turns slashes into "_", and collapses runs of underscores.
+    safe_user = sanitize_filename(username)
     out: list[str] = []
     for p in parts:
         # simple
-        p = p.replace("{username}", username)
-        p = p.replace("{user}", username)
+        p = p.replace("{username}", safe_user)
+        p = p.replace("{user}", safe_user)
+        # {category}, {subcategory} and {scrapmf_root} are internal fixed values
+        # or orchestrator-supplied, so they are left alone: sanitising them would
+        # change the documented scrapmf layout for no gain.
         p = p.replace("{category}", category)
         p = p.replace("{subcategory}", subcategory)
         p = p.replace("{scrapmf_root}", scrapmf_root)

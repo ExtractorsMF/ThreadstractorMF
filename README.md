@@ -6,6 +6,7 @@ Threads media downloader — `import threadstractormf` + CLI like `gallery-dl` /
 - **Media IDs** `post_id` (`/post/<code>`) + `_1/_2/_3` for carousels, no reposts
 - **Media** photos, videos, profile pic (`t51.2885-19`)
 - **Stack** `httpx[http2]` + `pydantic` + optional `curl_cffi` (TLS/JA4 impersonation) + `browser-cookie3` + `playwright` fallback, `uv`/`hatchling`, `requires-python >=3.10`
+- **Pagination** GraphQL walks the `after` cursor, so `--limit` is honoured beyond the first page
 
 ## Installation
 
@@ -71,6 +72,66 @@ threadstractormf --cookies cookies.txt \
 threadstractormf --cookies cookies.txt --filename-template "{post_id}_{num:02d}.{extension}" --dest ./dl @user
 ```
 
+### Output layout
+
+With the default template, an account lands like this:
+
+```
+./dl/
+├── photos/
+│   ├── 2026-04-14_DPa1b2C3d4E5_01.jpg      single photo
+│   ├── 2026-04-14_DPx9Y8z7W6V5_01.jpg      carousel → item 1 of 3
+│   ├── 2026-04-14_DPx9Y8z7W6V5_03.jpg      carousel → item 3 of 3
+│   └── 2026-04-14_DPcO2vE3rI4d_01.jpg      video poster (a JPEG)
+├── videos/
+│   ├── 2026-04-15_DPmN4oP5qR6S_01.mp4      video
+│   └── 2026-04-18_DPx9Y8z7W6V5_02.mp4      carousel → the video item
+├── profile/
+│   └── usuario_profile.jpg                 avatar (no date; it has none)
+└── .threadstractormf/
+    └── dedup.jsonl                         download ledger
+```
+
+The `{num:02d}` counts media items within a carousel. The extension reflects the
+real content (`video_cover.jpg` stays `.jpg`), and the folder comes from
+`media.type` — the two are independent, so a `.webm` video goes to `videos/`.
+
+**Splitting by type depends on the destination's name.** When `--dest` is a
+plain directory, media is sorted into `photos/`/`videos/`/`profile/`. When it is
+already one of those (or `posts/`, as `scrapmf` passes), everything stays flat:
+
+| `--dest` | images | videos | avatar |
+|---|---|---|---|
+| `./dl` | `dl/photos/` | `dl/videos/` | `dl/profile/` |
+| `./dl/posts` | `dl/posts/` | `dl/posts/` | `dl/posts/` |
+| `./dl/photos` | `dl/photos/` | `dl/photos/` | `dl/photos/` |
+
+### Download ledger (dedup)
+
+Completed downloads are recorded in `<dest>/.threadstractormf/dedup.jsonl`, keyed
+by **`(post_id, index)`** rather than by filename. That matters because the
+filename embeds the date and the extension, and both can change — while the post
+id is stable for the life of the post. Changing `--filename-template`, fixing an
+extension guess, or a `{date}` that rolls over to today will **not** re-download
+an existing archive.
+
+A download is skipped when any of these hold:
+
+1. `(post_id, index)` is in the ledger;
+2. the exact destination file exists (and is then recorded);
+3. a file for the same `post_id` under a different name is on disk — this adopts
+   archives created by older versions, e.g. a `.webm` previously saved as `.jpg`.
+
+The ledger is created on first use, so an existing archive keeps working
+unchanged and is picked up incrementally. `--overwrite` bypasses it, and
+`--no-archive` falls back to filename-only dedup.
+
+Adoption matches on a delimiter after the id, so `DPxyz123` never adopts
+`DPxyz1234` — a different post.
+
+Note: adoption leaves files under their old name. Renaming them is a separate,
+manual step.
+
 ### Options
 
 ```
@@ -80,7 +141,7 @@ target                          @username or https://www.threads.com/@user/media
 -d, --dest <path>               output dir [default: ./dl]
 -l, --limit <int>               posts limit
     --profile-pic-only          only avatar
-    --impersonate <str>         chrome (requires curl_cffi)
+    --impersonate <str>         chrome (requires curl_cffi: pip install 'threadstractormf[antibot]')
     --overwrite
     --no-rate-limit             disable anti rate-limit (not recommended)
     --cooldown <int>            ms between downloads [default: 2000]
@@ -88,7 +149,13 @@ target                          @username or https://www.threads.com/@user/media
     --rps <float>               req/s for GraphQL API [default: 0.5]
     --filename-template <str>   e.g. "{date:%Y-%m-%d}_{post_id}_{num:02d}.{extension}"
     --directory-template <str>  e.g. "{scrapmf_root}/{category}/{username}/{subcategory}"
+    --no-archive                disable the download ledger (dedup by filename only)
+    --no-adopt-existing         do not adopt files on disk under an older name
+    --get-urls                  print the media URLs instead of downloading (dry run)
 ```
+
+`--cookies` and `--cookies-from-browser` are alternatives, not combined: if both
+are given the browser wins.
 
 **Template variables:** `{post_id}`, `{media_id}` (=`post_id_1`), `{date:%Y-%m-%d}`, `{date:%Y}`, `{num}`, `{num:02d}`, `{username}`, `{category}=threads`, `{subcategory}=posts|profile`, `{extension}`.
 
@@ -111,7 +178,11 @@ Port of `threads-downloader/background.js` + `gallery-dl sleep`:
 - **Downloads CDNs** `scontent.cdninstagram.com`: `cooldown 2s` + `120s each 100` + `jitter 20%` ( → `3-5s` with `4000ms` + `jitter 0.25`), single worker
 - **GraphQL** `https://www.threads.com/graphql/query` (`doc_id 37598244946487292`): token bucket `0.5 rps` + `429 Retry-After` + exponential backoff `base 2.0` (like `gallery-dl --sleep 3-6 --sleep-request 8-15 --sleep-429 120`)
 
-Meta WAF checks JA3/JA4 TLS + HTTP/2 SETTINGS + `X-CSRFToken`/`X-ASBD-ID`/`X-IG-App-ID`. If `403` with `httpx`, install `curl_cffi` and use `--impersonate chrome` (byte-for-byte Chrome 131, same as `yt-dlp --impersonate chrome`).
+Meta WAF checks JA3/JA4 TLS + HTTP/2 SETTINGS + `X-CSRFToken`/`X-ASBD-ID`/`X-IG-App-ID`. If `403` with `httpx`, install `curl_cffi` and use `--impersonate chrome` (byte-for-byte Chrome, same mechanism as `yt-dlp --impersonate`). Accepted targets: `chrome`, `chrome131`, `firefox`, `safari`, `edge`, `tor` and other pinned fingerprints; an unknown name fails immediately with the list of valid ones.
+
+Impersonation covers **both** the GraphQL calls and the CDN downloads — a WAF that blocks the API also blocks the media fetches, so impersonating only half the traffic would not help.
+
+Retries only ever happen for genuinely transient failures: `429`, `5xx`, DNS/timeout/TLS resets. A permanent `403`/`404` is reported immediately instead of sitting through ~60s of backoff first.
 
 ## scrapmf Integration
 
@@ -153,11 +224,12 @@ Archive is deferred — `threads` currently dedups by filename (deterministic `{
 
 ```
 threadstractormf/
+  _backend.py     # httpx | curl_cffi backend, shared retry policy, pw cookies
   auth.py         # MozillaCookieJar + load_from_browser("brave")
   models.py       # Post/Media/Profile (pydantic)
   template.py     # {date:%Y-%m-%d}_{post_id}_{num:02d} renderer
   rate_limit.py   # BatchCooldownLimiter + ApiRateLimiter + backoff
-  api.py          # GraphQL doc_id 37598244946487292 + Playwright DOM fallback
+  api.py          # GraphQL doc_id 37598244946487292 (paginated) + Playwright DOM fallback
   downloader.py   # is_valid_media_url + download with rate-limit + template
   client.py       # Threadscraper facade
   cli.py          # Typer CLI
@@ -167,5 +239,9 @@ scripts/sniff.py  # Playwright capture of graphql (dev)
 ## Testing
 
 ```bash
-pytest -q  # 13 tests: auth Netscape tabs, media_id, is_valid_media_url, BatchCooldown
+pytest -q  # 212 tests: auth, models, rate limiting (fixed + adaptive), retry policy
+           # across both backends, GraphQL pagination, --impersonate, download
+           # ledger and adoption, extension/quality extraction, user-id
+           # resolution, subfolder layout, error messages
+mypy threadstractormf scripts  # type check (also runs in CI)
 ```

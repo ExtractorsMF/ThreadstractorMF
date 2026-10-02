@@ -1,6 +1,6 @@
 """Regression: download retry policy for transient network errors.
 
-- _is_transient_error classifies DNS flaps / timeouts / CDN 5xx as retryable
+- is_transient_error classifies DNS flaps / timeouts / CDN 5xx as retryable
   and 4xx or programming errors as permanent.
 - download_media retries transient failures (with .part atomic writes) and
   never leaves a truncated media at the final path.
@@ -11,11 +11,11 @@ from pathlib import Path
 import httpx
 import pytest
 
+from threadstractormf._backend import is_transient_error
 from threadstractormf.downloader import (
     _CDN_TIMEOUT,
     _DOWNLOAD_ATTEMPTS,
     _DOWNLOAD_BACKOFF_S,
-    _is_transient_error,
     download_media,
 )
 from threadstractormf.models import Media
@@ -39,22 +39,22 @@ def test_cdn_timeout_is_generous():
 
 
 def test_transient_dns_and_timeout_and_5xx_are_retryable():
-    assert _is_transient_error(httpx.ConnectError("[Errno -3] gaierror"))
-    assert _is_transient_error(httpx.ConnectTimeout("connect timeout"))
-    assert _is_transient_error(httpx.ReadTimeout("read timeout"))
-    assert _is_transient_error(httpx.RemoteProtocolError("peer closed"))
+    assert is_transient_error(httpx.ConnectError("[Errno -3] gaierror"))
+    assert is_transient_error(httpx.ConnectTimeout("connect timeout"))
+    assert is_transient_error(httpx.ReadTimeout("read timeout"))
+    assert is_transient_error(httpx.RemoteProtocolError("peer closed"))
     resp500 = httpx.Response(500, request=httpx.Request("GET", "https://cdn/x.mp4"))
-    assert _is_transient_error(
+    assert is_transient_error(
         httpx.HTTPStatusError("boom", request=resp500.request, response=resp500)
     )
 
 
 def test_permanent_4xx_and_other_errors_are_not_retryable():
     resp404 = httpx.Response(404, request=httpx.Request("GET", "https://cdn/x.mp4"))
-    assert not _is_transient_error(
+    assert not is_transient_error(
         httpx.HTTPStatusError("nope", request=resp404.request, response=resp404)
     )
-    assert not _is_transient_error(ValueError("bad url"))
+    assert not is_transient_error(ValueError("bad url"))
 
 
 def test_download_retries_then_succeeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

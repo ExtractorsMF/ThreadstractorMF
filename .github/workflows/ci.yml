@@ -27,5 +27,10 @@ jobs:
       - name: Lint (ruff)
         run: uv run ruff check .
 
+      # mypy pins python_version=3.10 (see [tool.mypy]) but runs on the matrix
+      # interpreter; the checks are version-independent for this codebase.
+      - name: Types (mypy)
+        run: uv run mypy threadstractormf scripts
+
       - name: Tests (pytest)
         run: uv run pytest -q

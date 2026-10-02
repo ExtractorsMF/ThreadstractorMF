@@ -16,13 +16,22 @@ from __future__ import annotations
 import json
 import random
 import re
+import sys
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from urllib.parse import urlparse
 
 import httpx
 
+from threadstractormf._backend import (
+    CurlClient,
+    is_retryable_status,
+    is_transient_error,
+    to_playwright_cookies,
+)
 from threadstractormf.auth import get_csrf_token, load_netscape_cookies
-from threadstractormf.models import Media, Post, Profile
+from threadstractormf.models import Media, MediaType, Post, Profile, extract_post_id
 from threadstractormf.rate_limit import (
     ApiRateLimiter,
     RateLimitConfig,
@@ -35,19 +44,70 @@ _GRAPHQL_URL = "https://www.threads.com/graphql/query"
 _X_IG_APP_ID = "238260118697367"
 _X_ASBD_ID = "129477"
 
+# Posts requested per GraphQL round trip. Kept at the value Threads was
+# observed to serve; pagination (see get_posts) walks the cursor instead of
+# asking for a bigger page, so a format change is less likely to break us.
+_PAGE_SIZE = 12
+# Hard stop for the cursor walk when no --limit is given. Sized to cover real
+# profiles in full (200 pages x 12 = 2400 posts) rather than to be fast; the
+# adaptive limiter in rate_limit.ApiRateLimiter handles the pacing, so a long
+# walk is slow instead of risky. When a limit is set the budget is derived from
+# it instead (see get_posts).
+_MAX_PAGES = 200
+
+
+def _warn(message: str) -> None:
+    """Diagnostic on stderr.
+
+    stdout carries the "one line per downloaded file" contract that scrapmf
+    parses, so anything informational must go to stderr instead.
+    """
+    print(f"threadstractormf: {message}", file=sys.stderr, flush=True)
+
+
+def _require_playwright() -> None:
+    """Raise an actionable ImportError when the browser extra is missing.
+
+    Without this, a fallback to the DOM scraper surfaces as a bare
+    ``ImportError: No module named 'playwright'``, which says nothing about how
+    to fix it. ``playwright`` lives in the optional ``browser`` extra, and the
+    browser binaries are a separate download, so both steps are spelled out.
+    """
+    try:
+        import playwright.sync_api  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "playwright is required for this step but is not installed.\n"
+            "  pip install 'threadstractormf[browser]'\n"
+            "  playwright install chromium\n"
+            "It is only needed when the GraphQL API path is unavailable; if you "
+            "only need the fast path, check that your cookies are valid."
+        ) from exc
+
 
 def _guess_ext(url: str) -> str:
-    u = url.lower()
-    if ".mp4" in u or "video" in u:
-        return "mp4"
-    if ".webp" in u:
-        return "webp"
-    if ".png" in u:
-        return "png"
-    if ".gif" in u:
-        return "gif"
-    if ".jpeg" in u:
-        return "jpeg"
+    """Best-effort file extension from the URL *path*.
+
+    Extension is read from the path segment itself rather than by searching the
+    whole URL: an image like ".../video_cover.jpg" used to be tagged `.mp4`
+    because the path contained the word "video", which produced files whose
+    extension disagreed with their contents.
+    """
+    path = urlparse(url).path.lower()
+    last_segment = path.rsplit("/", 1)[-1]
+    suffix = last_segment.rsplit(".", 1)[-1] if "." in last_segment else ""
+    # "jpg" is kept as-is (not folded into "jpeg") so filenames stay identical
+    # to previous versions and existing archives still dedup by name.
+    if suffix in {"jpg", "jpeg", "png", "webp", "gif", "avif", "heic", "bmp"}:
+        return suffix
+    video = {"mp4", "webm", "mov", "m4v"}
+    if suffix in video:
+        return suffix
+    # No usable extension in the path: fall back to the URL as a whole, which
+    # is how Threads serves some CDN URLs.
+    low = url.lower()
+    if ".mp4" in low or ".webm" in low or ".mov" in low:
+        return "mp4" if ".mp4" in low else ("webm" if ".webm" in low else "mov")
     return "jpg"
 
 
@@ -60,6 +120,66 @@ def _pick_best_image(candidates: list[dict]) -> str | None:
         return c.get("url")
     except Exception:
         return candidates[0].get("url")
+
+
+def _pick_best_video(versions: Any) -> str | None:
+    """Best MP4 URL out of a ``video_versions`` list.
+
+    Instagram orders these ascending by bitrate, so index 0 is the *worst*
+    rendition — picking it silently threw away resolution. Prefer the entry
+    with the largest pixel area, falling back to pixel count and then to the
+    last element (the highest rung in the ladder).
+    """
+    if not isinstance(versions, list) or not versions:
+        return None
+    candidates = [v for v in versions if isinstance(v, dict) and v.get("url")]
+    if not candidates:
+        return None
+
+    def score(item: dict) -> tuple[int, int]:
+        return (int(item.get("width") or 0) * int(item.get("height") or 0),
+                int(item.get("width") or 0))
+
+    best = max(candidates, key=score)
+    if score(best)[0] == 0 and len(candidates) > 1:
+        # No dimensions reported: trust the ordering and take the top rung.
+        best = candidates[-1]
+    url = best.get("url")
+    return str(url) if url else None
+
+
+def _parse_profile_html(html: str) -> tuple[str | None, str | None, str | None]:
+    """Extract ``(user_id, lsd, profile_pic_url)`` from a profile page.
+
+    A single pass over the document, shared by ``_resolve_user_id`` and
+    ``get_profile`` so one page fetch serves both.
+
+    Only ``userID`` identifies the account. The previous fallback to ``pk``
+    matched the *first* ``pk`` in the document, which belongs to a post — the
+    same field ``_parse_post_node`` treats as a post id — and then used it as
+    the GraphQL ``userID``. That produced empty results and a silent, very slow
+    fallback to the DOM scraper, with no way to tell the user why.
+    """
+    user_id = None
+    lsd = None
+    pic = None
+
+    m = re.search(r'"userID"\s*:\s*"(\d+)"', html)
+    if m:
+        user_id = m.group(1)
+
+    m = re.search(r'"lsd"\s*:\s*"([^"]+)"', html)
+    if m:
+        lsd = m.group(1)
+
+    m = re.search(r'"profile_pic_url"\s*:\s*"((?:[^"\\]|\\.)*)"', html)
+    if m:
+        # The value is JSON-escaped inside the HTML blob. Only ``\u0026`` and
+        # ``\/`` matter for a URL, and leaving ``\/`` in place produces a URL the
+        # CDN will not serve.
+        pic = m.group(1).replace(r"\u0026", "&").replace(r"\/", "/")
+
+    return user_id, lsd, pic
 
 
 def _parse_post_node(node: dict, fallback_username: str | None = None) -> Post | None:
@@ -99,6 +219,7 @@ def _parse_post_node(node: dict, fallback_username: str | None = None) -> Post |
         like_count = 0
         # carousel
         medias: list[Media] = []
+        vtype: MediaType = "image"
         carousel = post.get("carousel_media")
         # single media case
         if carousel and isinstance(carousel, list) and len(carousel) > 0:
@@ -107,10 +228,8 @@ def _parse_post_node(node: dict, fallback_username: str | None = None) -> Post |
                 url = None
                 vtype = "image"
                 if cm.get("video_versions"):
-                    vv = cm["video_versions"]
-                    if isinstance(vv, list) and vv:
-                        url = vv[0].get("url")
-                        vtype = "video"
+                    url = _pick_best_video(cm["video_versions"])
+                    vtype = "video"
                 if not url:
                     iv2 = cm.get("image_versions2", {})
                     url = _pick_best_image(iv2.get("candidates", []))
@@ -126,10 +245,8 @@ def _parse_post_node(node: dict, fallback_username: str | None = None) -> Post |
             url = None
             vtype = "image"
             if post.get("video_versions"):
-                vv = post["video_versions"]
-                if isinstance(vv, list) and vv:
-                    url = vv[0].get("url")
-                    vtype = "video"
+                url = _pick_best_video(post["video_versions"])
+                vtype = "video"
             if not url:
                 iv2 = post.get("image_versions2", {})
                 url = _pick_best_image(iv2.get("candidates", []))
@@ -208,12 +325,15 @@ class ThreadsAPI:
         self.cookies = cookies
         self.impersonate = impersonate
         self.timeout = timeout
-        self._client: httpx.Client | None = None
+        self._client: Any = None
         self.rate_limit_config = rate_limit_config or RateLimitConfig()
         self._api_limiter = ApiRateLimiter(
             rps=self.rate_limit_config.rps, enabled=self.rate_limit_config.enabled
         )
         self._user_id_cache: dict[str, str] = {}
+        # Profile HTML is fetched by both user-id resolution and get_profile; a
+        # scrape that does both should not pay for two requests.
+        self._profile_cache: dict[str, str] = {}
         self._lsd: str | None = None
 
     def _headers(self) -> dict[str, str]:
@@ -235,8 +355,24 @@ class ThreadsAPI:
         }
         return h
 
-    def _get_client(self) -> httpx.Client:
+    def _get_client(self) -> Any:
+        """Return the shared HTTP client.
+
+        ``curl_cffi`` (Chrome TLS/JA4 impersonation) when ``impersonate`` was
+        requested, otherwise ``httpx`` — the default path stays untouched.
+        """
         if self._client:
+            return self._client
+        if self.impersonate:
+            # curl_cffi takes (connect, total): the read budget must cover a
+            # whole GraphQL response, so scale it off the public `timeout`.
+            self._client = CurlClient(
+                impersonate=self.impersonate,
+                cookies=self.cookies,
+                headers=self._headers(),
+                connect_timeout=5.0,
+                total_timeout=max(30.0, self.timeout * 2),
+            )
             return self._client
         # fine-grained: connect fast-fails at 5s; read uses the public
         # `timeout` param (per-chunk, so slow-but-active responses survive)
@@ -252,116 +388,133 @@ class ThreadsAPI:
         )
         return self._client
 
-    def _request_with_rate_limit(self, method: str, url: str, **kwargs) -> httpx.Response:
-        """Wrapper with ApiRateLimiter + Retry-After + exponential backoff for 429/5xx."""
+    def _request_with_rate_limit(self, method: str, url: str, **kwargs) -> Any:
+        """Rate-limited request with retries for *transient* failures only.
+
+        Retries are driven by ``is_transient_error`` / ``is_retryable_status``,
+        which cover both the httpx and the curl_cffi exception families. In
+        particular a permanent 4xx (403 from Meta's WAF, 404, 400) now surfaces
+        on the first attempt instead of burning the full exponential backoff
+        (~60s) before reporting the very same error.
+
+        Honours ``Retry-After`` when the server sends it, otherwise falls back to
+        exponential backoff.
+        """
         client = self._get_client()
         if self.rate_limit_config.enabled:
             self._api_limiter.wait()
-        last_exc: Exception | None = None
-        for attempt in range(self.rate_limit_config.max_retries + 1):
+
+        max_retries = self.rate_limit_config.max_retries
+        base = self.rate_limit_config.backoff_base
+        last_exc: BaseException | None = None
+
+        for attempt in range(max_retries + 1):
             try:
                 resp = client.request(method, url, **kwargs)
-                if resp.status_code == 429 or resp.status_code >= 500:
-                    retry = parse_retry_after(dict(resp.headers))
-                    if retry is not None:
-                        import time
-
-                        time.sleep(retry)
-                    elif attempt < self.rate_limit_config.max_retries:
-                        backoff_sleep(attempt, base=self.rate_limit_config.backoff_base)
-                    else:
-                        resp.raise_for_status()
-                    if attempt < self.rate_limit_config.max_retries:
-                        continue
-                resp.raise_for_status()
-                return resp
-            except httpx.HTTPStatusError as e:
-                last_exc = e
-                if attempt < self.rate_limit_config.max_retries:
-                    retry = parse_retry_after(dict(e.response.headers)) if e.response else None
-                    if retry is not None:
-                        import time
-
-                        time.sleep(retry)
-                    else:
-                        backoff_sleep(attempt, base=self.rate_limit_config.backoff_base)
+            except Exception as exc:  # noqa: BLE001 - re-classified below
+                # Transport-level failure (DNS, timeout, TLS, reset...).
+                if attempt < max_retries and is_transient_error(exc):
+                    last_exc = exc
+                    backoff_sleep(attempt, base=base)
                     continue
                 raise
-            except httpx.RequestError as e:
-                last_exc = e
-                if attempt < self.rate_limit_config.max_retries:
-                    backoff_sleep(attempt, base=self.rate_limit_config.backoff_base)
+
+            # Retryable status (429/5xx): honour Retry-After, else back off.
+            if is_retryable_status(resp.status_code):
+                if resp.status_code == 429:
+                    # Tell the limiter the server objected, so every later
+                    # request spaces out even after this one succeeds.
+                    self._api_limiter.penalize()
+                if attempt < max_retries:
+                    retry_after = parse_retry_after(dict(resp.headers))
+                    if retry_after is not None:
+                        time.sleep(retry_after)
+                    else:
+                        backoff_sleep(attempt, base=base)
                     continue
-                raise
-        if last_exc:
+                last_exc = None
+                resp.raise_for_status()  # out of retries: surface the failure
+                return resp  # pragma: no cover - raise_for_status always raises
+
+            # 2xx/3xx, or a permanent 4xx: raise_for_status() raises right away
+            # for the latter, which is exactly what we want.
+            resp.raise_for_status()
+            self._api_limiter.relax()
+            return resp
+
+        # The loop only falls through when every attempt hit a retryable status
+        # and max_retries is exhausted on the last one (handled above), so this
+        # is only reachable if max_retries is negative.
+        if last_exc is not None:
             raise last_exc
-        raise RuntimeError("request failed without exception")
+        raise RuntimeError("request failed without an exception")
+
+    def _profile_html(self, username: str) -> str | None:
+        """Fetch and cache the profile page for ``username``.
+
+        Shared by user-id resolution and the profile lookup so that a scrape
+        which does both (the CLI does) pays for a single request instead of two.
+        """
+        cached = self._profile_cache.get(username)
+        if cached is not None:
+            return cached
+        try:
+            resp = self._request_with_rate_limit(
+                "GET", f"https://www.threads.com/@{username}"
+            )
+        except Exception:
+            return None
+        html = str(resp.text)
+        self._profile_cache[username] = html
+        return html
 
     def _resolve_user_id(self, username: str) -> str:
         if username in self._user_id_cache:
             return self._user_id_cache[username]
-        # Try via HTML using lsd/csrf
-        try:
-            resp = self._request_with_rate_limit("GET", f"https://www.threads.com/@{username}")
-            html = resp.text
-            # buscar userID en html: "userID":"<userID>"
-            m = re.search(r'"userID"\s*:\s*"(\d+)"', html)
-            if m:
-                uid = m.group(1)
-                self._user_id_cache[username] = uid
-                # extraer lsd
-                m2 = re.search(r'"lsd"\s*:\s*"([^"]+)"', html)
-                if m2:
-                    self._lsd = m2.group(1)
-                return uid
-            # fallback: data.userData
-            m = re.search(r'"pk"\s*:\s*"(\d+)"', html)
-            if m:
-                uid = m.group(1)
-                self._user_id_cache[username] = uid
-                return uid
-        except Exception:
-            pass
-        # fallback: raise if no resolved ID (no hardcoded IDs)
+
+        html = self._profile_html(username)
+        if html is not None:
+            user_id, lsd, _pic = _parse_profile_html(html)
+            if user_id:
+                self._user_id_cache[username] = user_id
+                if lsd:
+                    self._lsd = lsd
+                return user_id
+            # No userID: fall through to the DOM scraper rather than burning a
+            # GraphQL call on an id we already know is unreliable.
         raise ValueError(f"could not resolve userID for @{username}")
 
     def get_profile(self, username: str) -> Profile:
         username = username.lstrip("@").split("/")[0]
-        # Try Playwright DOM first if threads.com cookies present, else HTML regex
         try:
-            # quick html lookup for profile pic
-            resp = self._request_with_rate_limit("GET", f"https://www.threads.com/@{username}")
-            html = resp.text
-            m = re.search(r'"profile_pic_url"\s*:\s*"([^"]+)"', html)
-            pic = None
-            if m:
-                pic = m.group(1).replace(r"\u0026", "&")
-            # if no pic found, fall back to Playwright DOM
+            html = self._profile_html(username)
+            user_id = lsd = pic = None
+            if html is not None:
+                user_id, lsd, pic = _parse_profile_html(html)
+                if lsd:
+                    self._lsd = lsd
+                # Seed the cache so get_posts() can skip its own page fetch.
+                if user_id:
+                    self._user_id_cache[username] = user_id
+
             if not pic:
+                # Best-effort: without a pic in the HTML, ask the browser.
                 try:
                     pic = self._fetch_profile_pic_via_playwright(username)
-                except Exception:
-                    pass
-            uid = self._user_id_cache.get(username)
-            if not uid:
-                # extract from html if present
-                m2 = re.search(r'"userID"\s*:\s*"(\d+)"', html)
-                if m2:
-                    uid = m2.group(1)
-                else:
-                    # look for the user pk in edge data
-                    m3 = re.search(r'"pk"\s*:\s*"(\d+)"', html)
-                    if m3:
-                        uid = m3.group(1)
-            from threadstractormf.models import sanitize_filename
+                except Exception as exc:
+                    _warn(
+                        f"could not read the avatar for @{username} "
+                        f"({exc.__class__.__name__}); continuing without it"
+                    )
 
             profile_pic_media = None
             if pic:
-                from threadstractormf.models import Media
+                from threadstractormf.models import sanitize_filename
 
+                stem = f"{sanitize_filename(username)}_profile"
                 profile_pic_media = Media(
-                    id=f"{sanitize_filename(username)}_profile",
-                    post_id=f"{sanitize_filename(username)}_profile",
+                    id=stem,
+                    post_id=stem,
                     index=1,
                     type="image",
                     url=pic,
@@ -369,7 +522,7 @@ class ThreadsAPI:
                 )
             return Profile(
                 username=username,
-                user_id=uid,
+                user_id=user_id,
                 profile_pic_url=pic,
                 profile_pic_media=profile_pic_media,
             )
@@ -378,20 +531,15 @@ class ThreadsAPI:
 
     def _fetch_profile_pic_via_playwright(self, username: str) -> str | None:
         try:
+            # Optional enrichment: a missing browser here is not fatal, the caller
+            # just gets no avatar. Warn instead of failing silently.
+            _require_playwright()
             from playwright.sync_api import sync_playwright
 
-            # convertir jar a pw
-            pw = []
-            for c in self.cookies:
-                pw.append(
-                    {
-                        "name": c.name,
-                        "value": c.value,
-                        "domain": c.domain.lstrip("."),
-                        "path": c.path,
-                        "secure": bool(c.secure),
-                    }
-                )
+            # NB: the leading dot on the cookie domain must survive — Chromium
+            # would otherwise treat every cookie as host-only and send nothing
+            # to www.threads.com, leaving the browser logged out.
+            pw = to_playwright_cookies(self.cookies)
             with sync_playwright() as p:
                 b = p.chromium.launch(
                     headless=True,
@@ -404,7 +552,7 @@ class ThreadsAPI:
                     )
                 )
                 if pw:
-                    ctx.add_cookies(pw)
+                    ctx.add_cookies(cast("Any", pw))
                 page = ctx.new_page()
                 page.goto(f"https://www.threads.com/@{username}", wait_until="domcontentloaded")
                 page.wait_for_timeout(3000)
@@ -414,29 +562,17 @@ class ThreadsAPI:
                         || null"""
                 )
                 b.close()
-                return pic
+                return str(pic) if pic else None
         except Exception:
             return None
 
     def _fetch_posts_via_playwright(self, username: str, limit: int | None) -> list[Post]:
         from collections import defaultdict
 
+        _require_playwright()
         from playwright.sync_api import sync_playwright
 
-        pw = []
-        for c in self.cookies:
-            try:
-                pw.append(
-                    {
-                        "name": c.name,
-                        "value": c.value,
-                        "domain": c.domain.lstrip("."),
-                        "path": c.path,
-                        "secure": bool(c.secure),
-                    }
-                )
-            except Exception:
-                continue
+        pw = to_playwright_cookies(self.cookies)
         posts: list[Post] = []
         # XHR capture: threads ships media JSON (incl video_versions) via its own
         # api responses while scrolling; late posts are ONLY available here,
@@ -468,7 +604,7 @@ class ThreadsAPI:
             )
             if pw:
                 try:
-                    ctx.add_cookies(pw)
+                    ctx.add_cookies(cast("Any", pw))
                 except Exception:
                     pass
             page = ctx.new_page()
@@ -559,8 +695,16 @@ class ThreadsAPI:
                                 const s=el.src||el.srcset||"";
                                 if(!s) return false;
                                 if(s.includes('t51.2885-19')) return false;
-                                return s.includes('fbcdn')||s.includes('scontent')
-                                    ||s.includes('cdninstagram')||s.includes('.mp4');
+                                // Host suffix, not substring: a substring test
+                                // accepts any host embedding the name
+                                // (instagram.evil.test). The bare ".mp4"
+                                // alternative used to be here and bypassed the
+                                // host check entirely.
+                                try{
+                                    const host=new URL(s, location.href).hostname;
+                                    return [".cdninstagram.com",".cdninstagram.net",".fbcdn.net"]
+                                        .some(d=>host===d.slice(1)||host.endsWith(d));
+                                }catch(e){ return false; }
                             }).map(el=>el.src||el.srcset.split(' ')[0]);
                             if(media_urls.length>0) break;
                             container=container.parentElement;
@@ -588,8 +732,7 @@ class ThreadsAPI:
                         new_posts.append(d)
                 # convert to Post
                 for d in new_posts:
-                    m = re.search(r"/post/([^/?#]+)", d["permalink"])
-                    pid = m.group(1) if m else None
+                    pid = extract_post_id(d["permalink"])
                     if not pid:
                         continue
                     # simple video detection; assume image otherwise
@@ -664,6 +807,7 @@ class ThreadsAPI:
         username = username.lstrip("@").split("/")[0]
         # Try GraphQL; on failure (execution error) fall back to Playwright DOM
         # (robust for public profiles)
+        collected: list[Post] = []
         try:
             # GraphQL path — minimal, falls back to DOM on failure
             user_id = None
@@ -672,56 +816,119 @@ class ThreadsAPI:
             except Exception:
                 user_id = None
             if user_id:
-                # try it with rate limiting, but if data.mediaData is None, fall back
+                # GraphQL path: walk the `after` cursor until the profile is
+                # exhausted or `limit` is met. A single request only ever
+                # returns _PAGE_SIZE posts, so without this loop `--limit 50`
+                # silently truncated to one page.
                 variables = {
                     "after": None,
                     "allow_page_info_for_lox_user": False,
                     "before": None,
-                    "first": 12,
+                    "first": _PAGE_SIZE,
                     "last": None,
                     "userID": user_id,
                     "__relay_internal__pv__BarcelonaIsLoggedInrelayprovider": False,
                 }
-                data = {
-                    "av": "0",
-                    "__user": "0",
-                    "__a": "1",
-                    "__req": "1",
-                    "dpr": "1",
-                    "__ccg": "EXCELLENT",
-                    "__rev": "1045963118",
-                    "lsd": self._lsd or "",
-                    "jazoest": "22171",
-                    "fb_api_caller_class": "RelayModern",
-                    "fb_api_req_friendly_name": "BarcelonaProfileMediaTabRefetchableDirectQuery",
-                    "variables": json.dumps(variables),
-                    "server_timestamps": "true",
-                    "doc_id": _DOC_ID_MEDIA,
-                }
-                resp = self._request_with_rate_limit("POST", _GRAPHQL_URL, data=data)
-                j = resp.json()
-                if j.get("data") and j["data"].get("mediaData"):
-                    out: list[Post] = []
+                out: list[Post] = []
+                seen_ids: set[str] = set()
+                cursor: str | None = None
+                seen_cursors: set[str] = set()
+                # With a limit, never fetch more pages than could be needed.
+                # Reposts get filtered and posts are deduped, so a page can
+                # yield fewer than _PAGE_SIZE usable posts: leave headroom.
+                # _MAX_PAGES stays a hard ceiling so an absurd --limit cannot
+                # turn into an unbounded walk.
+                page_budget = _MAX_PAGES
+                if limit is not None:
+                    page_budget = min(
+                        _MAX_PAGES, max(1, -(-limit // _PAGE_SIZE) + 2)
+                    )
+                for _ in range(page_budget):
+                    variables["after"] = cursor
+                    body = {
+                        "av": "0",
+                        "__user": "0",
+                        "__a": "1",
+                        "__req": "1",
+                        "dpr": "1",
+                        "__ccg": "EXCELLENT",
+                        "__rev": "1045963118",
+                        "lsd": self._lsd or "",
+                        "jazoest": "22171",
+                        "fb_api_caller_class": "RelayModern",
+                        "fb_api_req_friendly_name": (
+                            "BarcelonaProfileMediaTabRefetchableDirectQuery"
+                        ),
+                        "variables": json.dumps(variables),
+                        "server_timestamps": "true",
+                        "doc_id": _DOC_ID_MEDIA,
+                    }
+                    resp = self._request_with_rate_limit("POST", _GRAPHQL_URL, data=body)
+                    j = resp.json()
+                    if not (j.get("data") and j["data"].get("mediaData")):
+                        break  # partial/absent payload: keep what we have
+
                     media_data = j["data"]["mediaData"]
-                    edges = media_data.get("edges", [])
-                    for edge in edges:
+                    for edge in media_data.get("edges", []) or []:
                         node = edge.get("node") or {}
                         post = _parse_post_node(node, fallback_username=username)
                         if not post:
                             continue
                         if exclude_reposts and post.username.lower() != username.lower():
                             continue
+                        # Guard against a cursor that loops back over edges we
+                        # already emitted.
+                        if post.id in seen_ids:
+                            continue
+                        seen_ids.add(post.id)
                         out.append(post)
                         if limit is not None and len(out) >= limit:
                             break
-                    if out:
-                        if limit is not None:
-                            out = out[:limit]
-                        return out
-        except Exception:
-            pass
+
+                    if limit is not None and len(out) >= limit:
+                        break
+
+                    # Everything parsed so far survives a failure further down.
+                    collected = out
+
+                    # page_info parsing is defensive: a missing/renamed key
+                    # must not turn into an infinite walk.
+                    page_info = media_data.get("page_info") or {}
+                    if not isinstance(page_info, dict) or not page_info.get("has_next_page"):
+                        break
+                    next_cursor = page_info.get("end_cursor")
+                    if not next_cursor or not isinstance(next_cursor, str):
+                        break
+                    if next_cursor in seen_cursors:
+                        break  # server repeating the cursor -> stop
+                    seen_cursors.add(next_cursor)
+                    cursor = next_cursor
+
+                if out:
+                    if limit is not None:
+                        out = out[:limit]
+                    return out
+        except Exception as exc:
+            # The cursor walk can fail several pages in. Anything already
+            # collected is still valid output, so keep it and only fall back to
+            # the DOM scraper when we came away empty-handed.
+            if collected:
+                _warn(f"GraphQL pagination stopped early ({exc.__class__.__name__})")
+                return collected[:limit] if limit is not None else collected
+            _warn(
+                f"GraphQL API path unavailable ({exc.__class__.__name__}: {exc}); "
+                "falling back to the Playwright scraper, which is slower."
+            )
         # Fallback DOM robusto
-        return self._fetch_posts_via_playwright(username, limit)
+        posts = self._fetch_posts_via_playwright(username, limit)
+        if not posts:
+            # Not an exception: an empty or private profile legitimately yields
+            # nothing, and that cannot be told apart from a silent failure.
+            _warn(
+                f"no posts found for @{username}. The account may be empty or "
+                "private, or the session may lack access."
+            )
+        return posts
 
     def close(self) -> None:
         if self._client:

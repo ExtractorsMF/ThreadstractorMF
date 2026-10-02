@@ -49,9 +49,6 @@ class FixedCooldownLimiter:
             time.sleep(wait_ms / 1000)
         self._last = time.monotonic() * 1000
 
-    def reset(self) -> None:
-        self._last = None
-
 
 class BatchCooldownLimiter(FixedCooldownLimiter):
     """Extends Fixed with a long cooldown every N downloads (background.js batch)."""
@@ -88,23 +85,93 @@ class BatchCooldownLimiter(FixedCooldownLimiter):
 
 
 class ApiRateLimiter:
-    """Simple token bucket for GraphQL: rps=0.5 => 1 req every 2s."""
+    """Paced limiter for GraphQL requests, with adaptive back-pressure.
 
-    def __init__(self, rps: float = 0.5, enabled: bool = True):
+    Base pacing is a plain interval (``rps=0.5`` -> one request every 2s), which
+    is deliberately slow because Meta answers a burst with 429s and, eventually,
+    with a WAF block.
+
+    On top of that the limiter reacts to what the server actually says:
+
+    * a 429 **doubles** the interval (capped at ``max_interval``), so repeated
+      complaints space requests out exponentially instead of hammering;
+    * a streak of successful requests **relaxes** it back toward the base rate,
+      one step at a time, so a single 429 does not permanently slow a crawl.
+
+    Net effect: a full profile still gets walked to the end, but the request rate
+    backs off exactly as much as the server demands and recovers on its own.
+    """
+
+    def __init__(
+        self,
+        rps: float = 0.5,
+        enabled: bool = True,
+        *,
+        max_interval: float = 60.0,
+        penalty_factor: float = 2.0,
+        relax_after: int = 5,
+        relax_factor: float = 0.75,
+    ):
         self.rps = rps
         self.enabled = enabled
+        self.max_interval = max_interval
+        self.penalty_factor = penalty_factor
+        self.relax_after = relax_after
+        self.relax_factor = relax_factor
         self._last: float | None = None
-        self._interval = 1.0 / rps if rps > 0 else 0
+        self._base_interval = 1.0 / rps if rps > 0 else 0.0
+        self._penalty = 1.0
+        self._ok_streak = 0
+
+    @property
+    def base_interval(self) -> float:
+        return self._base_interval
+
+    @property
+    def penalty(self) -> float:
+        return self._penalty
+
+    def current_interval(self) -> float:
+        """Effective seconds to wait between requests right now."""
+        if self._base_interval <= 0:
+            return 0.0
+        return min(self._base_interval * self._penalty, self.max_interval)
+
+    def _max_penalty(self) -> float:
+        if self._base_interval <= 0:
+            return 1.0
+        return self.max_interval / self._base_interval
+
+    def penalize(self) -> None:
+        """Call on 429 (or any rate-limit signal): back off harder."""
+        if not self.enabled:
+            return
+        self._penalty = min(self._penalty * self.penalty_factor, self._max_penalty())
+        self._ok_streak = 0
+
+    def relax(self) -> None:
+        """Call on success: decay the penalty back toward the base rate.
+
+        Decay is multiplicative so recovery from a deep penalty converges in a
+        handful of streaks. An additive step needed ~1160 successful requests to
+        climb back from the 60s cap, which in practice never happened.
+        """
+        if not self.enabled or self._penalty <= 1.0:
+            return
+        self._ok_streak += 1
+        if self._ok_streak >= self.relax_after:
+            self._penalty = max(1.0, self._penalty * self.relax_factor)
+            self._ok_streak = 0
 
     def wait(self) -> None:
-        if not self.enabled or self.rps <= 0:
+        if not self.enabled or self._base_interval <= 0:
             return
         now = time.monotonic()
         if self._last is None:
             self._last = now
             return
         elapsed = now - self._last
-        wait = self._interval - elapsed
+        wait = self.current_interval() - elapsed
         if wait > 0:
             time.sleep(wait)
         self._last = time.monotonic()

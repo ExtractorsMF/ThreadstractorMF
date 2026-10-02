@@ -17,11 +17,33 @@ from urllib.parse import urlparse
 
 import httpx
 
+from threadstractormf._backend import (
+    CurlClient,
+    StreamClient,
+    is_transient_error,
+)
+from threadstractormf.archive import DownloadLedger, find_existing_for_post
 from threadstractormf.models import Media, sanitize_filename
 from threadstractormf.rate_limit import BatchCooldownLimiter
 
 # Allowlist same as background.js:112-116
-_CDN_HINTS = ("fbcdn", "scontent", "cdninstagram", "instagram", "threads")
+# Hostname suffixes Meta serves media from.
+#
+# Matched as a *domain suffix*, never as a substring. Two reasons:
+#   * the CDN rotates regional hosts (instagram.fpei1-1.fna.fbcdn.net,
+#     scontent-xx.cdninstagram.com), so pinning literal hosts would go stale,
+#     while a suffix keeps working for a POP we have never seen;
+#   * a substring match accepts any host that merely embeds the name, which is
+#     what let https://instagram.evil.test/x.jpg and
+#     https://scontent.evil.com/v/t51.1/a.jpg through.
+#
+# "instagram" and "threads" are deliberately absent: those are brand names, not
+# hostnames.
+_CDN_HOST_SUFFIXES = (
+    ".cdninstagram.com",
+    ".cdninstagram.net",
+    ".fbcdn.net",
+)
 
 # Global limiter por defecto (port background.js:16-17). Se puede inyectar otro por llamada.
 _default_limiter = BatchCooldownLimiter(
@@ -29,16 +51,54 @@ _default_limiter = BatchCooldownLimiter(
 )
 
 
+# Directories that already represent one media type. Landing in one of them is
+# taken as "the caller decided where things go", so no further split happens.
+CONTENT_DIRS = frozenset({"photos", "videos", "profile", "posts"})
+
+
+def _split_subfolder(media: Media, dest: Path) -> str | None:
+    """Subdirectory for this media, or None to write straight into ``dest``.
+
+    Behaviour (unchanged, previously inlined):
+
+    ==================  ==========  ==========================
+    media                dest.name   result
+    ==================  ==========  ==========================
+    avatar               any but     ``profile``
+                        ``profile``
+    any                  one of      written into dest
+                        CONTENT_DIRS
+    video                anything    ``videos``
+                        else
+    image                anything    ``photos``
+                        else
+    ==================  ==========  ==========================
+
+    Note the folder comes from ``media.type`` (what the API declares), while the
+    file extension comes from the URL. The two are independent: a ``.webm`` video
+    is ``type="video"`` and therefore lands in ``videos/``.
+    """
+    if media.id.endswith("_profile"):
+        return None if dest.name == "profile" else "profile"
+    if dest.name in CONTENT_DIRS:
+        return None
+    return "videos" if media.type == "video" else "photos"
+
+
 def is_valid_media_url(url: str) -> bool:
-    """Port background.js:96-144 isValidMediaUrl."""
+    """Port background.js:96-144 isValidMediaUrl, with a domain-suffix host check."""
     if not url or not isinstance(url, str):
         return False
     try:
         u = urlparse(url)
         if u.scheme != "https":
             return False
-        host = u.netloc.lower()
-        if not any(h in host for h in _CDN_HINTS):
+        # A fully-qualified name may arrive with a trailing dot.
+        host = u.netloc.lower().rstrip(".")
+        # s[1:] allows the bare registrable domain (cdninstagram.com); otherwise
+        # the dot must match exactly one label boundary, so cdninstagram.com.evil.io
+        # and notcdninstagram.com are both rejected.
+        if not any(host == s[1:] or host.endswith(s) for s in _CDN_HOST_SUFFIXES):
             return False
         path = u.path.lower()
         has_ext = bool(re.search(r"\.(jpg|jpeg|png|webp|gif|mp4|webm|mov|avi)(\?|$)", path))
@@ -51,25 +111,6 @@ def is_valid_media_url(url: str) -> bool:
         return False
 
 
-def _is_transient_error(exc: BaseException) -> bool:
-    """True when a download error is worth retrying (flaky networks).
-
-    Covers DNS hiccups ([Errno -3] gaierror), connect/read timeouts and CDN
-    5xx responses. Permanent errors (invalid URL, 4xx) return False.
-    """
-    if isinstance(exc, httpx.TransportError):
-        # ConnectError (wraps gaierror/[Errno -3]), ConnectTimeout,
-        # ReadTimeout, RemoteProtocolError, etc.
-        return True
-    if isinstance(exc, httpx.HTTPStatusError):
-        return 500 <= exc.response.status_code < 600
-    if isinstance(exc, OSError):
-        import errno as _errno
-
-        return exc.errno in (-3, _errno.EAI_AGAIN)
-    return False
-
-
 # Retry policy for transient network errors (DNS resolution flaps, timeouts,
 # CDN hiccups). Extra attempts give the resolver/network time to recover.
 _DOWNLOAD_ATTEMPTS = 3
@@ -79,56 +120,69 @@ _DOWNLOAD_BACKOFF_S = (2.0, 5.0)
 # per-chunk, not total) and DNS/TLS setup gets breathing room on bad networks.
 _CDN_TIMEOUT = httpx.Timeout(connect=15.0, read=45.0, write=45.0, pool=30.0)
 
+# curl_cffi takes (connect, total): the second value bounds the whole transfer,
+# so it must be well above the per-chunk httpx read budget or big videos on slow
+# links get cut mid-download.
+_CDN_CURL_TIMEOUT = (15.0, 900.0)
+
+
+def _build_download_client(
+    *, impersonate: str | None, headers: dict[str, str]
+) -> StreamClient:
+    """Create the CDN client: Chrome impersonation when asked, else httpx."""
+    if impersonate:
+        return CurlClient(
+            impersonate=impersonate,
+            headers=headers,
+            connect_timeout=_CDN_CURL_TIMEOUT[0],
+            total_timeout=_CDN_CURL_TIMEOUT[1],
+        )
+    return httpx.Client(follow_redirects=True, timeout=_CDN_TIMEOUT, http2=True)
+
 
 def download_media(
     media: Media,
     dest: str | Path,
     *,
-    client: httpx.Client | None = None,
+    client: StreamClient | None = None,
+    impersonate: str | None = None,
     overwrite: bool = False,
     limiter: BatchCooldownLimiter | None = None,
     rate_limit: bool = True,
     filename_template: str | None = None,
     username: str | None = None,
     date_iso: str | None = None,
+    ledger: DownloadLedger | None = None,
+    adopt_existing: bool = True,
 ) -> Path:
-    """Download a Media to dest. Returns the final Path. Applies anti rate-limit if rate_limit=True.
-    If filename_template is given, it is used to generate the filename (gallery-dl style)."""
+    """Download a Media to dest. Returns the final Path.
+
+    Applies anti rate-limit if ``rate_limit=True``. When ``filename_template`` is
+    given it generates the filename (gallery-dl style).
+
+    Skipping happens at three levels, cheapest first:
+
+    1. ``(post_id, index)`` already in ``ledger`` — immune to the filename
+       changing (a fixed extension guess, a different template, a date that
+       rolled over);
+    2. the exact destination file exists — records it in the ledger;
+    3. with ``adopt_existing``, a file for the same ``post_id`` under a different
+       name is adopted — this is what saves a historical archive from being
+       re-downloaded when the naming scheme is corrected.
+
+    Levels 2 and 3 make the ledger self-seeding: the first run after upgrading
+    behaves exactly as before (filename dedup) while filling the ledger.
+    ``overwrite`` bypasses all three.
+    """
     if not is_valid_media_url(media.url):
         raise ValueError(f"invalid download URL: {media.url}")
 
-    dest = Path(dest).expanduser().resolve()
-    # For threads All: organize into sibling folders photos/videos/profile based on media type
-    # When dest is like .../<user_root> (quick scraper All), split there; otherwise use dest as is
-    # Detect if this is a threads All download (dest ends with username and media has type)
-    # We keep it simple: if dest name == username (or parent is username)
-    # and media.type is known, create subfolder
-    subfolder = None
-    if media.id.endswith("_profile") and dest.name != "profile":
-        subfolder = "profile"
-    elif media.type == "video":
-        # Only split if dest looks like a threads user root (contains username)
-        # and not already in videos/photos/profile
-        # Check if dest's name is username or its parent is username
-        # For quick scraper All, dest is .../<user_root>,
-        # so subfolder photos/videos/profile are siblings
-        # For direct scrape, dest is .../posts, we still want videos sibling
-        # To keep it simple for All, we create sibling folders when dest is a user root
-        if dest.name not in ("photos", "videos", "profile", "posts"):
-            subfolder = "videos"
-    elif media.type == "image":
-        if dest.name not in ("photos", "videos", "profile", "posts"):
-            # For All, image goes to photos; for single posts job, keep in dest
-            # (which is already photos or posts)
-            # Detect if this is an All download by checking if dest contains username and not posts
-            # For now, if dest is user root, split; otherwise keep as is
-            if dest.name not in ("photos", "videos", "profile"):
-                # Heuristic: if dest ends with username (like .../<user_root>), split
-                # We check if parent is not already a content folder
-                subfolder = "photos"
-
-    if subfolder:
-        dest = dest / subfolder
+    root = Path(dest).expanduser().resolve()
+    # Split photos/videos/profile only when dest is not already one of them.
+    # The ledger key is derived from `root`, BEFORE the split, so one account
+    # keeps a single ledger instead of one per media type.
+    subfolder = _split_subfolder(media, root)
+    dest = root / subfolder if subfolder else root
     dest.mkdir(parents=True, exist_ok=True)
 
     if filename_template:
@@ -145,8 +199,24 @@ def download_media(
         filename = media.filename()
     filename = sanitize_filename(filename)
     out = dest / filename
-    if out.exists() and not overwrite:
-        return out
+
+    if not overwrite:
+        # 1. the ledger knows about it under any name
+        if ledger is not None and ledger.has(media.post_id, media.index):
+            return out
+        # 2. the exact file is already there -> adopt it into the ledger
+        if out.exists():
+            if ledger is not None:
+                ledger.record(media.post_id, media.index, out)
+            return out
+        # 3. the same post under a *different* name (extension fix, template
+        #    change, date rollover). The ledger starts empty on the first run
+        #    after such a change, so without this the whole archive re-downloads.
+        if adopt_existing and ledger is not None:
+            adopted = find_existing_for_post(dest, media.post_id, media.index)
+            if adopted is not None:
+                ledger.record(media.post_id, media.index, adopted)
+                return adopted
 
     # Anti rate-limit: wait cooldown before downloading (port background.js:789-792)
     use_limiter = limiter if limiter is not None else _default_limiter
@@ -156,10 +226,6 @@ def download_media(
         use_limiter.wait()
 
     close_client = False
-    if client is None:
-        client = httpx.Client(follow_redirects=True, timeout=_CDN_TIMEOUT, http2=True)
-        close_client = True
-
     # Browser-like headers: video endpoints (/v/t65.*) reject python-httpx UA with 403
     cdn_headers = {
         "User-Agent": (
@@ -170,6 +236,10 @@ def download_media(
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.threads.net/",
     }
+
+    if client is None:
+        client = _build_download_client(impersonate=impersonate, headers=cdn_headers)
+        close_client = True
 
     # Retry loop for transient network errors; writes go to a .part temp file
     # so a failed attempt never leaves a truncated media at the final path.
@@ -187,11 +257,13 @@ def download_media(
                         for chunk in r.iter_bytes(chunk_size=8192):
                             f.write(chunk)
                 tmp.replace(out)
+                if ledger is not None:
+                    ledger.record(media.post_id, media.index, out)
                 return out
             except Exception as e:
                 last_exc = e
                 tmp.unlink(missing_ok=True)
-                if attempt < _DOWNLOAD_ATTEMPTS and _is_transient_error(e):
+                if attempt < _DOWNLOAD_ATTEMPTS and is_transient_error(e):
                     wait_s = _DOWNLOAD_BACKOFF_S[
                         min(attempt - 1, len(_DOWNLOAD_BACKOFF_S) - 1)
                     ]
@@ -215,10 +287,13 @@ def download_profile_pic(
     username: str,
     dest: str | Path,
     *,
-    client: httpx.Client | None = None,
+    client: StreamClient | None = None,
+    impersonate: str | None = None,
     limiter: BatchCooldownLimiter | None = None,
     rate_limit: bool = True,
     filename_template: str | None = None,
+    ledger: DownloadLedger | None = None,
+    adopt_existing: bool = True,
 ) -> Path:
     """Download profile pic with id f"{username}_profile"."""
     from threadstractormf.models import Media
@@ -241,7 +316,11 @@ def download_profile_pic(
     # profile uses filename_template if given, else {username}_{media_id}.{ext}
     if filename_template:
         return download_media(
-            media, dest, client=client, limiter=limiter, rate_limit=rate_limit,
-            filename_template=filename_template, username=username,
+            media, dest, client=client, impersonate=impersonate, limiter=limiter,
+            rate_limit=rate_limit, filename_template=filename_template, username=username,
+            ledger=ledger, adopt_existing=adopt_existing,
         )
-    return download_media(media, dest, client=client, limiter=limiter, rate_limit=rate_limit)
+    return download_media(
+        media, dest, client=client, impersonate=impersonate, limiter=limiter,
+        rate_limit=rate_limit, ledger=ledger, adopt_existing=adopt_existing,
+    )

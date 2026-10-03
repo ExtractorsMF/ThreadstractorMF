@@ -65,6 +65,31 @@ def _warn(message: str) -> None:
     print(f"threadstractormf: {message}", file=sys.stderr, flush=True)
 
 
+# Pacing for the DOM fallback's scroll walk. See the loop in
+# _fetch_posts_via_playwright for why the wait is not jittered throughout:
+# too short a wait makes the walk mistake "not rendered yet" for "end of
+# profile". v1.0.1 read whole profiles with 3000ms; 91a3a45 broke that.
+_SCROLL_WAIT_MS = 3000
+_SCROLL_JITTER_SCROLLS = 3
+
+# Inject the session cookies into the DOM fallback?
+#
+# Measured, not assumed: on a 9-post profile the fallback returns 4 posts with
+# the session cookies attached and all 9 without them. Threads serves a logged-in
+# client a truncated profile view whose own tab query answers
+# has_next_page=false after 4 posts; the anonymous view carries the whole
+# timeline. v1.0.5 scraped the profile without them (it stripped the leading
+# dot off every cookie domain, which made them host-only and unsent) and read
+# the account in full; v1.1.0 "fixed" the dot, the session arrived, and the
+# scrape silently lost 5 of 9 posts.
+#
+# So the dot is correct for the download/GraphQL paths — it is what makes
+# threads.net session cookies reach www.threads.net — but wrong for reading a
+# public profile page. Keeping both behaviours behind one flag is why this is a
+# parameter and not a revert.
+_PROFILE_FALLBACK_AUTHENTICATED = False
+
+
 def _require_playwright() -> None:
     """Raise an actionable ImportError when the browser extra is missing.
 
@@ -566,13 +591,21 @@ class ThreadsAPI:
         except Exception:
             return None
 
-    def _fetch_posts_via_playwright(self, username: str, limit: int | None) -> list[Post]:
+    def _fetch_posts_via_playwright(
+        self,
+        username: str,
+        limit: int | None,
+        *,
+        authenticated: bool = _PROFILE_FALLBACK_AUTHENTICATED,
+    ) -> list[Post]:
         from collections import defaultdict
 
         _require_playwright()
         from playwright.sync_api import sync_playwright
 
-        pw = to_playwright_cookies(self.cookies)
+        # See _PROFILE_FALLBACK_AUTHENTICATED: an anonymous context reads the
+        # whole profile, a logged-in one is served a truncated view.
+        pw = to_playwright_cookies(self.cookies) if authenticated else []
         posts: list[Post] = []
         # XHR capture: threads ships media JSON (incl video_versions) via its own
         # api responses while scrolling; late posts are ONLY available here,
@@ -613,23 +646,43 @@ class ThreadsAPI:
             # human-like jitter: fixed intervals look robotic to bot detection
             initial_wait_ms = random.uniform(2800, 3600)
             page.wait_for_timeout(initial_wait_ms)
-            # scroll patiently: stop only after 2 consecutive empty rounds
-            # (threads lazy-loads with delay; waits carry jitter for stealth)
-            max_scrolls = 40
+            # scroll patiently: stop only after several consecutive empty rounds
+            # (threads lazy-loads with delay; waits carry jitter for stealth).
+            # Two empty rounds at ~1.8s was not enough patience: the page had
+            # simply not finished fetching, so the walk declared the profile
+            # finished after the first viewport and returned 4 posts out of a
+            # much longer timeline without any warning.
+            max_scrolls = 60
+            empty_rounds_limit = 5
             seen_permalinks: set[str] = set()
             empty_rounds = 0
             prev_time_count = 0
             data: list[dict[str, Any]] = []
-            for _ in range(max_scrolls):
+            for scroll in range(max_scrolls):
                 page.mouse.wheel(0, 4000)
-                scroll_wait_ms = random.uniform(1350, 2250)
+                # Per-scroll pacing is what decides whether the profile is read
+                # in full. v1.0.1 waited 3000ms per scroll and needed 3 empty
+                # rounds to stop; 91a3a45 ("jittered waits") cut the wait to
+                # 1350-2250ms and the threshold to 2, and the scrape has
+                # returned only the first viewport ever since — 4 of 9 posts,
+                # silently. Threads needs well over 1.8s to render the next
+                # batch, so a shorter wait reads "nothing new" as "no more
+                # posts" and stops early.
+                #
+                # The jitter is kept, but only where it was never the problem:
+                # the first scrolls, which is what a bot detector actually
+                # samples. Deep into the walk, coverage wins.
+                if scroll < _SCROLL_JITTER_SCROLLS:
+                    scroll_wait_ms = random.uniform(_SCROLL_WAIT_MS, _SCROLL_WAIT_MS * 1.6)
+                else:
+                    scroll_wait_ms = _SCROLL_WAIT_MS
                 page.wait_for_timeout(scroll_wait_ms)
                 time_count = page.evaluate(
                     "() => document.querySelectorAll('time[datetime]').length"
                 )
                 if time_count == prev_time_count:
                     empty_rounds += 1
-                    if empty_rounds >= 2:
+                    if empty_rounds >= empty_rounds_limit:
                         break
                     # skip the heavy extraction when nothing new rendered
                     continue
@@ -873,9 +926,9 @@ class ThreadsAPI:
                         node = edge.get("node") or {}
                         post = _parse_post_node(node, fallback_username=username)
                         if not post:
-                            continue
+                                continue
                         if exclude_reposts and post.username.lower() != username.lower():
-                            continue
+                                continue
                         # Guard against a cursor that loops back over edges we
                         # already emitted.
                         if post.id in seen_ids:

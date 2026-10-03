@@ -57,6 +57,12 @@ def _scrape(pages, limit):
 
     api = ThreadsAPI({"csrftoken": "x"}, rate_limit_config=rl.RateLimitConfig(enabled=False))
     api._resolve_user_id = lambda _u: "999"
+    # get_posts falls back to the DOM scraper whenever GraphQL yields nothing
+    # (api.py:923). Unstubbed, that launches a real Chromium and hits the
+    # network, so a legitimately empty profile made these tests pass by
+    # accident and fail on a runner with no browsers installed. The other
+    # test modules stub this the same way.
+    api._fetch_posts_via_playwright = lambda _u, _l: []
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
     return api.get_posts("user", limit=limit), calls
 

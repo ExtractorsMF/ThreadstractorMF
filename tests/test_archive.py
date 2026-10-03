@@ -15,6 +15,7 @@ from threadstractormf.archive import (
     DownloadLedger,
     find_existing_for_post,
     ledger_path_for,
+    migrate_legacy_ledger,
 )
 from threadstractormf.client import Threadscraper
 from threadstractormf.downloader import download_media
@@ -123,7 +124,7 @@ def test_ledger_never_writes_duplicates(tmp_path):
 def test_ledger_path_is_inside_the_media_directory(tmp_path):
     path = ledger_path_for(tmp_path)
     assert path.parent.parent == tmp_path
-    assert path.parts[-2] == ".threadstractormf"
+    assert path.parts[-2] == ".archive"
     assert path.name == "dedup.jsonl"
 
 
@@ -432,3 +433,122 @@ def test_a_carousel_downloads_every_item(tmp_path):
     on_disk = sorted(p.name for p in tmp_path.rglob("*C1_*"))
     assert len(on_disk) == 5, f"one file per item, got {on_disk}"
     assert len(set(on_disk)) == 5, "no item may reuse another's file"
+
+
+# --- the ledger is opt-in ----------------------------------------------------
+#
+# A plain download must leave nothing behind: no directory, no bookkeeping.
+# Until 1.1.1 the ledger was on by default, so every scrape dropped a
+# .threadstractormf/ folder into the user's media directory whether they wanted
+# one or not.
+
+
+def test_no_ledger_directory_without_the_flag(tmp_path):
+    """The default writes no directory at all."""
+    srv = _Server()
+    media = srv.video("DP1")
+    dest = tmp_path / "dl"
+    srv.download(media, dest, filename_template=TPL, date_iso=DATE)
+
+    assert not ledger_path_for(dest).exists(), "no ledger without --archive"
+    assert not (dest / ".archive").exists()
+    assert not (dest / ".threadstractormf").exists()
+    assert dest.exists(), "the media itself must still be there"
+
+
+def test_archive_flag_creates_the_directory(tmp_path):
+    scraper = Threadscraper(cookies={"sessionid": "x"}, archive=True)
+    try:
+        ledger = scraper._ledger_for(tmp_path / "dl")
+    finally:
+        scraper.close()
+    assert ledger is not None
+    assert ledger.path.name == "dedup.jsonl"
+    assert ledger.path.parent.name == ".archive"
+
+
+def test_the_directory_is_hidden(tmp_path):
+    """Kept dot-prefixed so it does not clutter the media listing."""
+    assert ledger_path_for(tmp_path).parent.name.startswith(".")
+
+
+# --- migration from the pre-1.1.1 directory name ---------------------------
+
+
+def _write_legacy(dest, lines):
+    legacy = dest / ".threadstractormf"
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / "dedup.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return legacy / "dedup.jsonl"
+
+
+def test_legacy_ledger_is_migrated(tmp_path):
+    """Losing it would re-download the whole library on the next run."""
+    dest = tmp_path / "dl"
+    _write_legacy(dest, ['{"post_id": "DP1", "index": 1, "path": "/x", "t": 1}'])
+
+    assert migrate_legacy_ledger(dest) is True
+    new = ledger_path_for(dest)
+    assert new.exists(), "the ledger must arrive in .archive/"
+    assert not (dest / ".threadstractormf").exists(), "and the old dir goes away"
+    ledger = DownloadLedger(new)
+    ledger.load()
+    assert ledger.has("DP1", 1), "the history has to survive the move"
+
+
+def test_no_legacy_directory_is_not_an_error(tmp_path):
+    assert migrate_legacy_ledger(tmp_path / "dl") is False
+
+
+def test_migration_keeps_entries_from_both_files(tmp_path):
+    """Both present: merge, never overwrite, or half the library re-downloads."""
+    dest = tmp_path / "dl"
+    _write_legacy(dest, ['{"post_id": "OLD", "index": 1, "path": "/x", "t": 1}'])
+    new = ledger_path_for(dest)
+    new.parent.mkdir(parents=True, exist_ok=True)
+    new.write_text(
+        '{"post_id": "NEW", "index": 1, "path": "/y", "t": 2}\n', encoding="utf-8"
+    )
+
+    assert migrate_legacy_ledger(dest) is True
+    ledger = DownloadLedger(new)
+    ledger.load()
+    assert ledger.has("OLD", 1)
+    assert ledger.has("NEW", 1)
+
+
+def test_migration_does_not_duplicate_shared_lines(tmp_path):
+    dest = tmp_path / "dl"
+    line = '{"post_id": "SAME", "index": 1, "path": "/x", "t": 1}'
+    _write_legacy(dest, [line])
+    new = ledger_path_for(dest)
+    new.parent.mkdir(parents=True, exist_ok=True)
+    new.write_text(line + "\n", encoding="utf-8")
+
+    migrate_legacy_ledger(dest)
+    body = new.read_text(encoding="utf-8").splitlines()
+    assert body.count(line) == 1
+
+
+def test_migration_leaves_unknown_files_in_the_old_directory(tmp_path):
+    """rmdir only: deleting anything else there would lose data."""
+    dest = tmp_path / "dl"
+    legacy = _write_legacy(dest, ['{"post_id": "DP1", "index": 1, "path": "/x", "t": 1}'])
+    (legacy.parent / "notebook.txt").write_text("keep me", encoding="utf-8")
+
+    migrate_legacy_ledger(dest)
+    assert ledger_path_for(dest).exists()
+    assert (legacy.parent / "notebook.txt").exists(), "must not delete unknown files"
+
+
+def test_the_client_migrates_before_reading(tmp_path):
+    """End to end: a library built under the old name must not re-download."""
+    dest = tmp_path / "dl"
+    _write_legacy(dest, ['{"post_id": "DP1", "index": 1, "path": "/x", "t": 1}'])
+    scraper = Threadscraper(cookies={"sessionid": "x"}, archive=True)
+    try:
+        ledger = scraper._ledger_for(dest)
+    finally:
+        scraper.close()
+    assert ledger is not None
+    assert ledger.has("DP1", 1)

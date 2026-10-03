@@ -28,9 +28,14 @@ Append-only JSONL, one object per completed download::
 
 The shape mirrors scrapmf's own archive
 (``~/.config/scrapmf/archive/<site>/<account>.jsonl``), so the two can be
-unified later without a migration. The file lives inside the media directory
-(``<dest>/.threadstractormf/dedup.jsonl``) so that moving the library moves the
-record along with it.
+unified later. The file lives inside the media directory
+(``<dest>/.archive/dedup.jsonl``) so that moving the library moves the record
+along with it.
+
+The ledger is opt-in: pass ``--archive`` (or ``archive=True``) to enable it.
+Without it nothing is written and no directory is created, so a plain download
+leaves no bookkeeping behind. Ledgers written by 1.1.0 and earlier, under
+``.threadstractormf/``, are migrated on first use.
 """
 
 from __future__ import annotations
@@ -43,8 +48,12 @@ from pathlib import Path
 from typing import Any
 
 # Hidden directory kept beside the media so it travels with an archive.
-LEDGER_DIRNAME = ".threadstractormf"
+LEDGER_DIRNAME = ".archive"
 LEDGER_FILENAME = "dedup.jsonl"
+
+# The directory used up to 1.1.0. It is renamed, not deleted: an existing
+# library must not re-download itself because the bookkeeping moved.
+LEGACY_LEDGER_DIRNAME = ".threadstractormf"
 
 
 def ledger_path_for(dest: str | Path) -> Path:
@@ -54,6 +63,49 @@ def ledger_path_for(dest: str | Path) -> Path:
     subdirectory, otherwise one account ends up with several ledgers.
     """
     return Path(dest).expanduser().resolve() / LEDGER_DIRNAME / LEDGER_FILENAME
+
+
+def migrate_legacy_ledger(dest: str | Path) -> bool:
+    """Move a pre-1.1.1 ``.threadstractormf/dedup.jsonl`` to ``.archive/``.
+
+    Returns True when a ledger was migrated. Losing it would make the next run
+    treat every already-downloaded file as new, so the rename has to carry the
+    history over rather than quietly starting empty.
+
+    The legacy directory is removed only when it is empty afterwards, so
+    anything else a future version stored there survives.
+    """
+    root = Path(dest).expanduser().resolve()
+    legacy = root / LEGACY_LEDGER_DIRNAME / LEDGER_FILENAME
+    if not legacy.is_file():
+        return False
+    target = ledger_path_for(root)
+    if target.exists():
+        # Both present: keep the new one and merge the old lines into it, so
+        # neither set of downloads is forgotten.
+        try:
+            existing = set(target.read_text(encoding="utf-8").splitlines())
+            extra = [
+                line
+                for line in legacy.read_text(encoding="utf-8").splitlines()
+                if line.strip() and line.strip() not in existing
+            ]
+            if extra:
+                with target.open("a", encoding="utf-8") as fh:
+                    fh.write("\n".join(extra) + "\n")
+        except OSError:
+            return False
+    else:
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            legacy.replace(target)
+        except OSError:
+            return False
+    try:
+        legacy.parent.rmdir()
+    except OSError:
+        pass  # not empty: leave it alone rather than delete unknown files
+    return True
 
 
 class DownloadLedger:

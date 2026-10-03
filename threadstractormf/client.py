@@ -15,7 +15,11 @@ from typing import Any
 import httpx
 
 from threadstractormf.api import ThreadsAPI
-from threadstractormf.archive import DownloadLedger, ledger_path_for
+from threadstractormf.archive import (
+    DownloadLedger,
+    ledger_path_for,
+    migrate_legacy_ledger,
+)
 from threadstractormf.auth import load_cookies_dict, load_netscape_cookies
 from threadstractormf.downloader import download_media, download_profile_pic
 from threadstractormf.models import Media, Post, Profile
@@ -117,13 +121,17 @@ class Threadscraper:
         """Ledger covering ``dest``, or None when archiving is disabled.
 
         One ledger per destination root — not per photos/ videos/ subdirectory —
-        created and loaded on first use.
+        created and loaded on first use. Archiving is opt-in, so without it no
+        ledger object is built and no directory is written.
         """
         if not self.archive:
             return None
         key = str(Path(dest).expanduser().resolve())
         ledger = self._ledgers.get(key)
         if ledger is None:
+            # Carry over a pre-1.1.1 ledger before reading, so renaming the
+            # bookkeeping directory does not re-download the whole library.
+            migrate_legacy_ledger(key)
             ledger = DownloadLedger(ledger_path_for(key))
             ledger.load()
             self._ledgers[key] = ledger

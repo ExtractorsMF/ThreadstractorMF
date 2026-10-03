@@ -9,7 +9,10 @@ from typing import Any
 import typer
 from rich.console import Console
 
+from threadstractormf import __version__
+from threadstractormf.api import ScrapeReport
 from threadstractormf.auth import load_netscape_cookies
+from threadstractormf.downloader import DownloadOutcome, DownloadStatus
 
 try:  # browser_cookie3 is an optional extra
     from browser_cookie3 import BrowserCookieError as _BrowserCookieError
@@ -25,6 +28,7 @@ app = typer.Typer(
 console = Console()
 err_console = Console(stderr=True)
 
+
 # stdout carries the "one line per downloaded file" contract that scrapmf counts,
 # so nothing printed to it may be wrapped. Rich wraps at the terminal width
 # (80 columns when piped), which silently turned a single 600-character CDN URL
@@ -32,9 +36,85 @@ err_console = Console(stderr=True)
 # ``soft_wrap=True`` disables that for the lines we emit.
 
 
+def _count(outcome: DownloadOutcome, report: ScrapeReport) -> None:
+    """Tally one media outcome so the summary can tell the truth."""
+    if outcome.status is DownloadStatus.DOWNLOADED:
+        report.downloaded += 1
+    else:
+        report.skipped += 1
+
+
+def _report_scrape(report: ScrapeReport) -> None:
+    """Print what the scrape actually found, and what it could not.
+
+    Goes to stderr: stdout is the "one line per downloaded file" contract, and
+    a summary there would be counted as a file by scrapmf. Before this, a
+    scrape that returned 4 posts out of a 60-post profile ended in complete
+    silence and was indistinguishable from a full one.
+    """
+    parts = [
+        f"posts: {report.posts}",
+        f"media: {report.media}",
+        f"downloaded: {report.downloaded}",
+        f"skipped: {report.skipped}",
+        f"failed: {report.failed}",
+    ]
+    if report.no_media:
+        parts.append(f"without media: {report.no_media}")
+    if report.reposts_skipped:
+        parts.append(f"reposts excluded: {report.reposts_skipped}")
+    if report.unparsed:
+        parts.append(f"unparseable: {report.unparsed}")
+    err_console.print("summary — " + " | ".join(parts), soft_wrap=True)
+
+    if report.api_error:
+        err_console.print(
+            f"warning — the API did not respond as expected: {report.api_error}",
+            soft_wrap=True,
+        )
+    if report.used_fallback:
+        err_console.print(
+            "warning — the browser fallback was used: it is slower than the "
+            "API, but it reads the public profile in full.",
+            soft_wrap=True,
+        )
+    if report.truncated:
+        err_console.print(
+            f"warning — the walk stopped before exhausting the profile "
+            f"({report.stop_reason or 'unknown reason'}).",
+            soft_wrap=True,
+        )
+    if report.failed:
+        err_console.print(
+            f"warning — {report.failed} media item(s) could not be downloaded.",
+            soft_wrap=True,
+        )
+
+
+def _version_callback(value: bool) -> None:
+    """Print the version and exit.
+
+    Eager and callback-style rather than a plain option in main(): the target
+    argument is required, so a plain flag could not run before typer rejected
+    the missing argument. A callback with is_eager runs first and exits.
+    """
+    if value:
+        # __version__ is what semantic-release rewrites (version_variables in
+        # pyproject.toml), so this can never drift from the released build.
+        console.print(f"threadstractormf {__version__}", soft_wrap=True)
+        raise typer.Exit()
+
+
 @app.command()
 def main(
     target: str = typer.Argument(..., help="URL https://www.threads.net/@user/media or @username"),
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=_version_callback,
+        is_eager=True,
+        help="Show the installed version and exit",
+    ),
     cookies: Path | None = typer.Option(
         None, "--cookies", "-c", help="Netscape cookies.txt (gallery-dl compatible)"
     ),
@@ -49,7 +129,7 @@ def main(
     photos_only: bool = typer.Option(False, "--photos-only", help="Photos only"),
     videos_only: bool = typer.Option(False, "--videos-only", help="Videos only"),
     impersonate: str | None = typer.Option(
-        None, "--impersonate", help="chrome (usa curl_cffi si instalado)"
+        None, "--impersonate", help="chrome (requires curl_cffi to be installed)"
     ),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing files"),
     no_rate_limit: bool = typer.Option(
@@ -70,12 +150,12 @@ def main(
     directory_template: str | None = typer.Option(
         None,
         "--directory-template",
-        help="Template directory, ej {scrapmf_root}/{category}/{username}/{subcategory}",
+        help="Template directory, e.g. {scrapmf_root}/{category}/{username}/{subcategory}",
     ),
-    no_archive: bool = typer.Option(
+    archive: bool = typer.Option(
         False,
-        "--no-archive",
-        help="Disable the download ledger (dedup falls back to filename only)",
+        "--archive",
+        help="Keep a ledger of downloads in <dest>/.archive so re-runs skip them",
     ),
     no_adopt_existing: bool = typer.Option(
         False,
@@ -166,7 +246,7 @@ def main(
         cooldown_ms=cooldown,
         cooldown_after_100_ms=batch_cooldown,
         rps=rps,
-        archive=not no_archive,
+        archive=archive,
     )
     adopt_existing = not no_adopt_existing
     # resolve directory_template -> final dest
@@ -219,12 +299,16 @@ def main(
             console.print(f"[green]profile pic -> {out}[/green]", soft_wrap=True)
             return
         posts = scraper.get_posts(username, limit=limit)
+        report = scraper.last_report
         # For All (no filter), also download profile pic after posts as sibling
         is_all = not photos_only and not videos_only and not profile_pic_only
         if is_all and not get_urls:
             try:
-                out = scraper.download_profile_pic(username, final_dest, filename_template=None)
-                console.print(f"  {username}_profile -> {out}", soft_wrap=True)
+                outcome = scraper.download_profile_pic(
+                    username, final_dest, filename_template=None
+                )
+                _count(outcome, report)
+                console.print(f"  {username}_profile -> {outcome.path}", soft_wrap=True)
             except Exception:
                 pass
         for post in posts:
@@ -241,7 +325,7 @@ def main(
                 # media.id is already post_id or post_id_N,
                 # with configurable template for chronological ordering
                 try:
-                    out = scraper.download(
+                    outcome = scraper.download(
                         media,
                         final_dest,
                         overwrite=overwrite,
@@ -250,14 +334,17 @@ def main(
                         date_iso=post.datetime_iso,
                         adopt_existing=adopt_existing,
                     )
-                    console.print(f"  {media.id} -> {out}", soft_wrap=True)
+                    _count(outcome, report)
+                    console.print(f"  {media.id} -> {outcome.path}", soft_wrap=True)
                 except Exception as e:
+                    report.failed += 1
                     # un media fallido (URL firmada expirada, 403 CDN, red)
                     # must not abort the whole batch. Failures go to STDERR
                     # (stdout is the "one line per downloaded file" contract
                     # with orchestrators like scrapmf — a failed line there
                     # would be miscounted as a successful download).
                     err_console.print(f"[yellow]  {media.id} failed: {e}[/yellow]")
+        _report_scrape(report)
     finally:
         scraper.close()
 

@@ -18,7 +18,7 @@ from threadstractormf.archive import (
     migrate_legacy_ledger,
 )
 from threadstractormf.client import Threadscraper
-from threadstractormf.downloader import download_media
+from threadstractormf.downloader import DownloadStatus, download_media
 from threadstractormf.models import Media
 
 TPL = "{date:%Y-%m-%d}_{post_id}_{num:02d}.{extension}"
@@ -156,7 +156,9 @@ def test_download_without_a_ledger_still_works(tmp_path):
     """archive=False must behave exactly as before: download and stop."""
     srv = _Server()
     media = srv.video("DP1")
-    out = srv.download(media, tmp_path, filename_template=TPL, date_iso=DATE)
+    outcome = srv.download(media, tmp_path, filename_template=TPL, date_iso=DATE)
+    out = outcome.path
+    assert outcome.status is DownloadStatus.DOWNLOADED
     assert out.exists()
     assert srv.calls == 1
     assert not ledger_path_for(tmp_path).exists(), "no ledger is written"
@@ -333,7 +335,7 @@ def test_legacy_extension_is_adopted_not_re_downloaded(tmp_path):
     ledger = DownloadLedger(ledger_path_for(tmp_path))
     ledger.load()
     # now the same post, correctly detected as .webm -> a different filename
-    out = srv.download(
+    outcome = srv.download(
         srv.video("DPwE5bM6nO7P", "webm"),
         tmp_path,
         filename_template=TPL,
@@ -341,7 +343,8 @@ def test_legacy_extension_is_adopted_not_re_downloaded(tmp_path):
         ledger=ledger,
     )
     assert srv.calls == before, "must adopt, not re-download"
-    assert out.suffix == ".jpg", "the existing file keeps its old name"
+    assert outcome.status is DownloadStatus.ADOPTED, "recognised, not fetched"
+    assert outcome.path.suffix == ".jpg", "the existing file keeps its old name"
     assert ledger.has("DPwE5bM6nO7P", 1)
 
 

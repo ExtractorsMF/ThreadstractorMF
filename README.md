@@ -70,7 +70,41 @@ threadstractormf --cookies cookies.txt \
 
 # no date, post_id only
 threadstractormf --cookies cookies.txt --filename-template "{post_id}_{num:02d}.{extension}" --dest ./dl @user
+
+# keep a ledger so re-runs skip what is already downloaded (opt-in)
+threadstractormf --cookies cookies.txt --archive --dest ./dl @user
+
+# dry run: print the media URLs and write nothing
+threadstractormf --cookies cookies.txt --get-urls --dest ./dl @user
+
+threadstractormf --version
 ```
+
+### Reporting
+
+Every run ends with a summary on **stderr** — stdout stays a strict
+"one line per downloaded file" stream, because scrapmf counts those lines to
+report progress:
+
+```
+summary — posts: 9 | media: 54 | downloaded: 55 | skipped: 0 | failed: 0
+```
+
+`downloaded` counts files whose bytes were actually fetched; `skipped` counts
+media that was already on disk (recognised by the ledger, by the exact filename,
+or adopted under an older name). Before, both were announced identically, so a
+run that downloaded nothing looked exactly like a full one.
+
+Warnings follow when something was incomplete, each naming the cause rather than
+just failing:
+
+```
+warning — the API did not respond as expected: GraphQL returned errors: …
+warning — the browser fallback was used …
+warning — the walk stopped before exhausting the profile …
+```
+
+A partial scrape can no longer end in silence.
 
 ### Output layout
 
@@ -108,10 +142,14 @@ already one of those (or `posts/`, as `scrapmf` passes), everything stays flat:
 
 ### Download ledger (dedup)
 
-Completed downloads are recorded in `<dest>/.threadstractormf/dedup.jsonl`, keyed
-by **`(post_id, index)`** rather than by filename. That matters because the
-filename embeds the date and the extension, and both can change — while the post
-id is stable for the life of the post. Changing `--filename-template`, fixing an
+**Off by default.** Pass `--archive` to enable it. Without that flag nothing is
+written and no directory is created, so a plain download leaves no bookkeeping
+behind.
+
+Completed downloads are recorded in `<dest>/.archive/dedup.jsonl`, keyed by
+**`(post_id, index)`** rather than by filename. That matters because the filename
+embeds the date and the extension, and both can change — while the post id is
+stable for the life of the post. Changing `--filename-template`, fixing an
 extension guess, or a `{date}` that rolls over to today will **not** re-download
 an existing archive.
 
@@ -122,9 +160,14 @@ A download is skipped when any of these hold:
 3. a file for the same `post_id` under a different name is on disk — this adopts
    archives created by older versions, e.g. a `.webm` previously saved as `.jpg`.
 
-The ledger is created on first use, so an existing archive keeps working
-unchanged and is picked up incrementally. `--overwrite` bypasses it, and
-`--no-archive` falls back to filename-only dedup.
+The ledger is created on first use once `--archive` is passed, so an existing
+archive keeps working unchanged and is picked up incrementally. `--overwrite`
+bypasses it entirely.
+
+Ledgers written by 1.1.0 and earlier lived in `<dest>/.threadstractormf/`. They
+are migrated to `.archive/` automatically the first time `--archive` is used, so
+upgrading does not re-download a library. If both directories exist, their
+entries are merged rather than one overwriting the other.
 
 Adoption matches on a delimiter after the id, so `DPxyz123` never adopts
 `DPxyz1234` — a different post.
@@ -140,7 +183,9 @@ target                          @username or https://www.threads.com/@user/media
     --cookies-from-browser <str> brave|chrome|firefox|edge (reads local DB)
 -d, --dest <path>               output dir [default: ./dl]
 -l, --limit <int>               posts limit
-    --profile-pic-only          only avatar
+      --profile-pic-only          only avatar
+      --photos-only               only image media (skip videos)
+      --videos-only               only video media (skip images)
     --impersonate <str>         chrome (requires curl_cffi: pip install 'threadstractormf[antibot]')
     --overwrite
     --no-rate-limit             disable anti rate-limit (not recommended)
@@ -149,10 +194,12 @@ target                          @username or https://www.threads.com/@user/media
     --rps <float>               req/s for GraphQL API [default: 0.5]
     --filename-template <str>   e.g. "{date:%Y-%m-%d}_{post_id}_{num:02d}.{extension}"
     --directory-template <str>  e.g. "{scrapmf_root}/{category}/{username}/{subcategory}"
-    --no-archive                disable the download ledger (dedup by filename only)
-    --no-adopt-existing         do not adopt files on disk under an older name
-    --get-urls                  print the media URLs instead of downloading (dry run)
-```
+--archive                   keep a download ledger in <dest>/.archive so
+                                 re-runs skip what is already on disk (opt-in)
+      --no-adopt-existing         do not adopt files on disk under an older name
+      --get-urls                  print the media URLs instead of downloading (dry run)
+      --version                   print the installed version and exit
+  ```
 
 `--cookies` and `--cookies-from-browser` are alternatives, not combined: if both
 are given the browser wins.
@@ -183,6 +230,36 @@ Meta WAF checks JA3/JA4 TLS + HTTP/2 SETTINGS + `X-CSRFToken`/`X-ASBD-ID`/`X-IG-
 Impersonation covers **both** the GraphQL calls and the CDN downloads — a WAF that blocks the API also blocks the media fetches, so impersonating only half the traffic would not help.
 
 Retries only ever happen for genuinely transient failures: `429`, `5xx`, DNS/timeout/TLS resets. A permanent `403`/`404` is reported immediately instead of sitting through ~60s of backoff first.
+
+### Known limitation: the GraphQL query is rejected
+
+`doc_id 37598244946487292` currently answers `200 OK` with
+`errors: [{"message": "execution error", "severity": "CRITICAL"}]` and no data.
+Meta rotates these ids, so the hardcoded one goes stale. When that happens the
+query is **not** used and the scrape falls back to the browser path below; the
+warning on stderr says so explicitly.
+
+The query the web app itself issues (a different `doc_id`, same
+`fb_api_req_friendly_name`) still answers correctly, so recovering this path
+means picking up the current id.
+
+### Fallback: the browser path, and why it runs anonymously
+
+Without GraphQL, posts are read from the profile page with Playwright.
+
+That fallback deliberately runs **without the session cookies**. Measured on a
+9-post profile: an authenticated context returns **4** posts, an anonymous one
+returns **all 9**. Threads serves a logged-in client a truncated profile view
+whose own tab query answers `has_next_page=false` after four posts, while the
+anonymous view carries the whole timeline.
+
+The leading dot on cookie domains is still preserved everywhere it matters — it
+is what makes `threads.net` session cookies reach `www.threads.net` for
+downloads and API calls. Only the profile page view is anonymous, so the two
+behaviours coexist instead of one undoing the other.
+
+The scroll walk waits `3000ms` per step (jittered for the first few) and gives
+up only after 5 consecutive rounds with nothing new rendered.
 
 ## scrapmf Integration
 
@@ -229,12 +306,13 @@ threadstractormf/
   models.py       # Post/Media/Profile (pydantic)
   template.py     # {date:%Y-%m-%d}_{post_id}_{num:02d} renderer
   rate_limit.py   # BatchCooldownLimiter + ApiRateLimiter + backoff
-  api.py          # GraphQL doc_id 37598244946487292 (paginated) + Playwright DOM fallback
-  downloader.py   # is_valid_media_url + download with rate-limit + template
-  client.py       # Threadscraper facade
-  cli.py          # Typer CLI
-scripts/sniff.py  # Playwright capture of graphql (dev)
-```
+api.py          # GraphQL doc_id 37598244946487292 (paginated) + Playwright DOM fallback
+    archive.py      # DownloadLedger: .archive/dedup.jsonl + legacy migration
+    downloader.py   # is_valid_media_url + download with rate-limit + template
+    client.py       # Threadscraper facade
+    cli.py          # Typer CLI
+  scripts/sniff.py  # Playwright capture of graphql (dev)
+  ```
 
 ## Testing
 

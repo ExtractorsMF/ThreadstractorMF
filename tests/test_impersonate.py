@@ -167,7 +167,9 @@ def test_download_uses_impersonation_and_writes_complete_file(tmp_path, monkeypa
     try:
         url = f"{base}/v/t65.37117/VIDEO.mp4?_nc_cat=101"
         media = Media(id="V1", post_id="V1", index=1, type="video", url=url, ext="mp4")
-        out = download_media(media, tmp_path, impersonate="chrome", rate_limit=False)
+        out = download_media(
+            media, tmp_path, impersonate="chrome", rate_limit=False
+        ).path
         assert out.read_bytes() == PAYLOAD
         assert not (out.with_name(out.name + ".part")).exists()
     finally:
@@ -193,7 +195,7 @@ def test_download_without_impersonation_still_uses_httpx(tmp_path, monkeypatch):
             return client
 
         monkeypatch.setattr(dl, "_build_download_client", spy)
-        out = download_media(media, tmp_path, rate_limit=False)
+        out = download_media(media, tmp_path, rate_limit=False).path
         assert out.read_bytes() == PAYLOAD
         assert created["type"] is httpx.Client
     finally:

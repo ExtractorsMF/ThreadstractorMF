@@ -16,6 +16,7 @@ from threadstractormf.downloader import (
     _CDN_TIMEOUT,
     _DOWNLOAD_ATTEMPTS,
     _DOWNLOAD_BACKOFF_S,
+    DownloadStatus,
     download_media,
 )
 from threadstractormf.models import Media
@@ -73,7 +74,9 @@ def test_download_retries_then_succeeds(tmp_path: Path, monkeypatch: pytest.Monk
     client = httpx.Client(
         transport=httpx.MockTransport(handler), timeout=_CDN_TIMEOUT
     )
-    out = download_media(media, dest, client=client, rate_limit=False)
+    outcome = download_media(media, dest, client=client, rate_limit=False)
+    out = outcome.path
+    assert outcome.status is DownloadStatus.DOWNLOADED
     assert out.exists()
     assert out.read_bytes() == b"video-bytes"
     assert not Path(str(out) + ".part").exists()

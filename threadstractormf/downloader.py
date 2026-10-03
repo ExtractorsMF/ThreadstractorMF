@@ -12,6 +12,8 @@ User rules:
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -140,6 +142,28 @@ def _build_download_client(
     return httpx.Client(follow_redirects=True, timeout=_CDN_TIMEOUT, http2=True)
 
 
+class DownloadStatus(str, Enum):
+    """Whether a media call actually fetched bytes.
+
+    download_media used to return a bare Path from every branch, so a file the
+    ledger already knew about was indistinguishable from a fresh download: the
+    CLI announced both as "downloaded" and any summary built on it would have
+    been fiction.
+    """
+
+    DOWNLOADED = "downloaded"
+    SKIPPED = "skipped"  # the ledger already had this (post_id, index)
+    ADOPTED = "adopted"  # found on disk under another name
+
+
+@dataclass(frozen=True)
+class DownloadOutcome:
+    """Result of one media download: where it ended up, and how it got there."""
+
+    path: Path
+    status: DownloadStatus
+
+
 def download_media(
     media: Media,
     dest: str | Path,
@@ -154,8 +178,11 @@ def download_media(
     date_iso: str | None = None,
     ledger: DownloadLedger | None = None,
     adopt_existing: bool = True,
-) -> Path:
-    """Download a Media to dest. Returns the final Path.
+) -> DownloadOutcome:
+    """Download a Media to dest.
+
+    Returns where it landed plus whether bytes were actually fetched: a media
+    the ledger already knew about returns SKIPPED, not DOWNLOADED.
 
     Applies anti rate-limit if ``rate_limit=True``. When ``filename_template`` is
     given it generates the filename (gallery-dl style).
@@ -203,12 +230,12 @@ def download_media(
     if not overwrite:
         # 1. the ledger knows about it under any name
         if ledger is not None and ledger.has(media.post_id, media.index):
-            return out
+            return DownloadOutcome(out, DownloadStatus.SKIPPED)
         # 2. the exact file is already there -> adopt it into the ledger
         if out.exists():
             if ledger is not None:
                 ledger.record(media.post_id, media.index, out)
-            return out
+            return DownloadOutcome(out, DownloadStatus.ADOPTED)
         # 3. the same post under a *different* name (extension fix, template
         #    change, date rollover). The ledger starts empty on the first run
         #    after such a change, so without this the whole archive re-downloads.
@@ -216,7 +243,7 @@ def download_media(
             adopted = find_existing_for_post(dest, media.post_id, media.index)
             if adopted is not None:
                 ledger.record(media.post_id, media.index, adopted)
-                return adopted
+                return DownloadOutcome(adopted, DownloadStatus.ADOPTED)
 
     # Anti rate-limit: wait cooldown before downloading (port background.js:789-792)
     use_limiter = limiter if limiter is not None else _default_limiter
@@ -259,7 +286,7 @@ def download_media(
                 tmp.replace(out)
                 if ledger is not None:
                     ledger.record(media.post_id, media.index, out)
-                return out
+                return DownloadOutcome(out, DownloadStatus.DOWNLOADED)
             except Exception as e:
                 last_exc = e
                 tmp.unlink(missing_ok=True)
@@ -294,7 +321,7 @@ def download_profile_pic(
     filename_template: str | None = None,
     ledger: DownloadLedger | None = None,
     adopt_existing: bool = True,
-) -> Path:
+) -> DownloadOutcome:
     """Download profile pic with id f"{username}_profile"."""
     from threadstractormf.models import Media
 

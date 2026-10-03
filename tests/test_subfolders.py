@@ -75,7 +75,8 @@ def _download(media, dest) -> Path:
     client = httpx.Client(
         transport=httpx.MockTransport(lambda _r: httpx.Response(200, content=b"x"))
     )
-    return download_media(media, dest, client=client, rate_limit=False)
+    # download_media returns a DownloadOutcome; these tests care about paths.
+    return download_media(media, dest, client=client, rate_limit=False).path
 
 
 def test_plain_dest_creates_photos_and_videos(tmp_path):

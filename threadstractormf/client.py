@@ -14,14 +14,18 @@ from typing import Any
 
 import httpx
 
-from threadstractormf.api import ThreadsAPI
+from threadstractormf.api import ScrapeReport, ThreadsAPI
 from threadstractormf.archive import (
     DownloadLedger,
     ledger_path_for,
     migrate_legacy_ledger,
 )
 from threadstractormf.auth import load_cookies_dict, load_netscape_cookies
-from threadstractormf.downloader import download_media, download_profile_pic
+from threadstractormf.downloader import (
+    DownloadOutcome,
+    download_media,
+    download_profile_pic,
+)
 from threadstractormf.models import Media, Post, Profile
 
 
@@ -91,6 +95,11 @@ class Threadscraper:
     ) -> list[Post]:
         return self.api.get_posts(username, limit=limit, exclude_reposts=exclude_reposts)
 
+    @property
+    def last_report(self) -> ScrapeReport:
+        """Counters for the most recent get_posts() call."""
+        return self.api.last_report
+
     # --- download ---
     def download(
         self,
@@ -102,7 +111,7 @@ class Threadscraper:
         username: str | None = None,
         date_iso: str | None = None,
         adopt_existing: bool = True,
-    ) -> Path:
+    ) -> DownloadOutcome:
         return download_media(
             media,
             dest,
@@ -146,13 +155,13 @@ class Threadscraper:
         filename_template: str | None = None,
         username: str | None = None,
         date_iso: str | None = None,
-    ) -> list[Path]:
+    ) -> list[DownloadOutcome]:
         """Download a list with built-in anti rate-limit protection.
 
         ``date_iso`` is passed through to the template: without it a
         ``{date:...}`` filename stamped every file with the current date.
         """
-        out: list[Path] = []
+        out: list[DownloadOutcome] = []
         for m in medias:
             out.append(
                 self.download(
@@ -168,7 +177,7 @@ class Threadscraper:
 
     def download_profile_pic(
         self, username: str, dest: str | Path, *, filename_template: str | None = None
-    ) -> Path:
+    ) -> DownloadOutcome:
         profile = self.get_profile(username)
         if not profile.profile_pic_url:
             raise ValueError(f"No profile_pic_url for {username}")

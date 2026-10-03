@@ -18,6 +18,7 @@ import random
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -63,6 +64,50 @@ def _warn(message: str) -> None:
     parses, so anything informational must go to stderr instead.
     """
     print(f"threadstractormf: {message}", file=sys.stderr, flush=True)
+
+
+@dataclass
+class ScrapeReport:
+    """Counters for one get_posts() call.
+
+    A scrape that silently returns a fraction of a profile is indistinguishable
+    from a complete one unless the numbers are kept: the GraphQL path can die
+    into the DOM fallback, posts can be dropped as reposts or for failing to
+    parse, and the cursor walk can stop early. All of that used to be invisible
+    — a 4-post scrape looked exactly like a complete one.
+    """
+
+    posts: int = 0
+    media: int = 0
+    unparsed: int = 0
+    reposts_skipped: int = 0
+    no_media: int = 0
+    pages_fetched: int = 0
+    truncated: bool = False
+    stop_reason: str = ""
+    used_fallback: bool = False
+    api_error: str = ""
+    limit: int | None = None
+    # Filled in by the CLI as the media loop runs: download_media reports
+    # whether it fetched bytes or merely recognised an existing file.
+    downloaded: int = 0
+    skipped: int = 0
+    failed: int = 0
+
+
+class _NonJsonResponse(Exception):
+    """The GraphQL endpoint answered with the web app instead of JSON."""
+
+
+def _finish_report(report: ScrapeReport, posts: list[Any]) -> None:
+    """Fill the derived counters once the post list is final.
+
+    Tolerates non-Post entries: tests stub the DOM fallback with sentinels, and
+    a diagnostic helper must not be the thing that breaks them.
+    """
+    report.posts = len(posts)
+    report.media = sum(len(getattr(p, "media", ())) for p in posts)
+    report.no_media = sum(1 for p in posts if not getattr(p, "media", ()))
 
 
 # Pacing for the DOM fallback's scroll walk. See the loop in
@@ -360,6 +405,9 @@ class ThreadsAPI:
         # scrape that does both should not pay for two requests.
         self._profile_cache: dict[str, str] = {}
         self._lsd: str | None = None
+        # Counters for the most recent get_posts() call, so the CLI can report a
+        # truncated scrape instead of ending in silence.
+        self.last_report = ScrapeReport()
 
     def _headers(self) -> dict[str, str]:
         csrf = get_csrf_token(self.cookies) or ""
@@ -861,13 +909,16 @@ class ThreadsAPI:
         # Try GraphQL; on failure (execution error) fall back to Playwright DOM
         # (robust for public profiles)
         collected: list[Post] = []
+        report = ScrapeReport(limit=limit)
+        self.last_report = report
         try:
             # GraphQL path — minimal, falls back to DOM on failure
             user_id = None
             try:
                 user_id = self._resolve_user_id(username)
-            except Exception:
+            except Exception as exc:
                 user_id = None
+                report.api_error = f"userID: {exc.__class__.__name__}"
             if user_id:
                 # GraphQL path: walk the `after` cursor until the profile is
                 # exhausted or `limit` is met. A single request only ever
@@ -917,8 +968,43 @@ class ThreadsAPI:
                         "doc_id": _DOC_ID_MEDIA,
                     }
                     resp = self._request_with_rate_limit("POST", _GRAPHQL_URL, data=body)
-                    j = resp.json()
+                    report.pages_fetched += 1
+                    # Threads answers 200 text/html (the web app shell) when the
+                    # query is rejected — stale doc_id, a rotated __rev, a
+                    # missing LSD. That used to raise inside resp.json(), get
+                    # swallowed by the broad except below and surface only as
+                    # "falling back to the DOM scraper", hiding the real cause.
+                    # Decode defensively rather than trusting the content-type:
+                    # a real GraphQL reply may omit the header, and what matters
+                    # is whether the body parses as JSON at all.
+                    try:
+                        j = resp.json()
+                    except ValueError as exc:
+                        ctype = (resp.headers.get("content-type") or "no content-type")
+                        report.api_error = (
+                            f"GraphQL returned {resp.status_code} {ctype.split(';')[0]} "
+                            f"instead of JSON ({exc.__class__.__name__}); "
+                            "stale doc_id or __rev"
+                        )
+                        raise _NonJsonResponse(report.api_error) from exc
                     if not (j.get("data") and j["data"].get("mediaData")):
+                        # Distinguish "the server refused the query" from "the
+                        # payload was merely partial". Threads answers a stale
+                        # doc_id / rotated __rev with 200 JSON carrying
+                        # errors: [{"severity": "CRITICAL", ...}] and no data —
+                        # indistinguishable from an empty profile unless the
+                        # errors field is inspected, which it never was.
+                        errors = j.get("errors") or []
+                        if errors:
+                            msgs = "; ".join(
+                                str(e.get("message", e))[:60]
+                                for e in errors[:2]
+                                if isinstance(e, dict)
+                            ) or "no detail"
+                            report.api_error = f"GraphQL returned errors: {msgs}"
+                            report.stop_reason = "the API rejected the query"
+                        else:
+                            report.stop_reason = "mediaData absent"
                         break  # partial/absent payload: keep what we have
 
                     media_data = j["data"]["mediaData"]
@@ -926,9 +1012,11 @@ class ThreadsAPI:
                         node = edge.get("node") or {}
                         post = _parse_post_node(node, fallback_username=username)
                         if not post:
-                                continue
+                            report.unparsed += 1
+                            continue
                         if exclude_reposts and post.username.lower() != username.lower():
-                                continue
+                            report.reposts_skipped += 1
+                            continue
                         # Guard against a cursor that loops back over edges we
                         # already emitted.
                         if post.id in seen_ids:
@@ -939,6 +1027,7 @@ class ThreadsAPI:
                             break
 
                     if limit is not None and len(out) >= limit:
+                        report.stop_reason = f"limit reached ({limit})"
                         break
 
                     # Everything parsed so far survives a failure further down.
@@ -948,31 +1037,43 @@ class ThreadsAPI:
                     # must not turn into an infinite walk.
                     page_info = media_data.get("page_info") or {}
                     if not isinstance(page_info, dict) or not page_info.get("has_next_page"):
+                        report.stop_reason = "the server reports no further pages"
                         break
                     next_cursor = page_info.get("end_cursor")
                     if not next_cursor or not isinstance(next_cursor, str):
+                        report.stop_reason = "page_info carries no usable end_cursor"
                         break
                     if next_cursor in seen_cursors:
+                        report.stop_reason = "the server repeated the cursor"
                         break  # server repeating the cursor -> stop
                     seen_cursors.add(next_cursor)
                     cursor = next_cursor
+                else:
+                    report.truncated = True
+                    report.stop_reason = f"page budget of {page_budget} exhausted"
 
                 if out:
                     if limit is not None:
                         out = out[:limit]
+                    _finish_report(report, out)
                     return out
         except Exception as exc:
             # The cursor walk can fail several pages in. Anything already
             # collected is still valid output, so keep it and only fall back to
             # the DOM scraper when we came away empty-handed.
             if collected:
+                report.truncated = True
                 _warn(f"GraphQL pagination stopped early ({exc.__class__.__name__})")
+                _finish_report(report, collected[:limit] if limit is not None else collected)
                 return collected[:limit] if limit is not None else collected
+            detail = report.api_error or f"{exc.__class__.__name__}: {exc}"
             _warn(
-                f"GraphQL API path unavailable ({exc.__class__.__name__}: {exc}); "
+                f"GraphQL API path unavailable ({detail}); "
                 "falling back to the Playwright scraper, which is slower."
             )
         # Fallback DOM robusto
+        report.used_fallback = True
+        report.truncated = True  # the DOM fallback only ever sees a viewport
         posts = self._fetch_posts_via_playwright(username, limit)
         if not posts:
             # Not an exception: an empty or private profile legitimately yields
@@ -981,6 +1082,7 @@ class ThreadsAPI:
                 f"no posts found for @{username}. The account may be empty or "
                 "private, or the session may lack access."
             )
+        _finish_report(report, posts)
         return posts
 
     def close(self) -> None:

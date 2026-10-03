@@ -14,6 +14,8 @@ from typer.testing import CliRunner
 
 import threadstractormf.cli as cli_module
 import threadstractormf.client as client_module
+from threadstractormf.api import ScrapeReport
+from threadstractormf.downloader import DownloadOutcome, DownloadStatus
 from threadstractormf.models import Media, Post, Profile
 
 MAGIC = "# Netscape HTTP Cookie File"
@@ -47,6 +49,11 @@ class FakeScraper:
 
     def get_profile(self, username):
         return Profile(username=username, profile_pic_url=AVATAR)
+
+    @property
+    def last_report(self):
+        # The CLI reads this after get_posts to build the summary.
+        return ScrapeReport(posts=1, media=len(_post().media))
 
     def download(self, media, dest, **kwargs):
         self.downloads.append(media.id)
@@ -229,11 +236,11 @@ def test_downloaded_paths_are_also_unwrapped(cookies_file, tmp_path, monkeypatch
     class _Downloader(FakeScraper):
         def download(self, media, dest, **kwargs):
             self.downloads.append(media.id)
-            return long_path
+            return DownloadOutcome(long_path, DownloadStatus.DOWNLOADED)
 
         def download_profile_pic(self, username, dest, **kwargs):
             self.avatar_downloads.append(username)
-            return long_path
+            return DownloadOutcome(long_path, DownloadStatus.DOWNLOADED)
 
     monkeypatch.setattr(client_module, "Threadscraper", lambda **kw: _Downloader(**kw))
     result = _run(cookies_file, tmp_path / "dl")

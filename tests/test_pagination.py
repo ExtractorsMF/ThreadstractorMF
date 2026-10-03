@@ -53,7 +53,14 @@ def _scrape(pages, limit):
         import urllib.parse
 
         calls["afters"].append(json.loads(urllib.parse.parse_qs(body)["variables"][0])["after"])
-        return httpx.Response(200, content=json.dumps(pages[min(i, len(pages) - 1)]).encode())
+        # content_type matters: get_posts now checks it to tell a real GraphQL
+        # payload from the HTML shell Threads serves when it rejects the query,
+        # and a bare httpx.Response defaults to no content-type at all.
+        return httpx.Response(
+            200,
+            content=json.dumps(pages[min(i, len(pages) - 1)]).encode(),
+            headers={"content-type": "application/json"},
+        )
 
     api = ThreadsAPI({"csrftoken": "x"}, rate_limit_config=rl.RateLimitConfig(enabled=False))
     api._resolve_user_id = lambda _u: "999"

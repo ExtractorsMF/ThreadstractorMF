@@ -245,8 +245,8 @@ def _pick_best_video(versions: Any) -> str | None:
     return str(url) if url else None
 
 
-def _parse_profile_html(html: str) -> tuple[str | None, str | None, str | None, str | None]:
-    """Extract ``(user_id, lsd, profile_pic_url, server_revision)`` from a page.
+def _parse_profile_html(html: str) -> tuple[str | None, str | None, str | None]:
+    """Extract ``(user_id, lsd, profile_pic_url)`` from a profile page.
 
     A single pass over the document, shared by ``_resolve_user_id`` and
     ``get_profile`` so one page fetch serves both.
@@ -260,7 +260,6 @@ def _parse_profile_html(html: str) -> tuple[str | None, str | None, str | None, 
     user_id = None
     lsd = None
     pic = None
-    server_revision = None
 
     m = re.search(r'"userID"\s*:\s*"(\d+)"', html)
     if m:
@@ -279,12 +278,6 @@ def _parse_profile_html(html: str) -> tuple[str | None, str | None, str | None, 
         if m:
             lsd = m.group(1)
 
-    # Same for __rev: the hardcoded one is stale, and the page carries the
-    # revision it was built with.
-    m = re.search(r'"server_revision":\s*"?(\d+)"?', html)
-    if m:
-        server_revision = m.group(1)
-
     m = re.search(r'"profile_pic_url"\s*:\s*"((?:[^"\\]|\\.)*)"', html)
     if m:
         # The value is JSON-escaped inside the HTML blob. Only ``\u0026`` and
@@ -292,7 +285,7 @@ def _parse_profile_html(html: str) -> tuple[str | None, str | None, str | None, 
         # CDN will not serve.
         pic = m.group(1).replace(r"\u0026", "&").replace(r"\/", "/")
 
-    return user_id, lsd, pic, server_revision
+    return user_id, lsd, pic
 
 
 def _parse_post_node(node: dict, fallback_username: str | None = None) -> Post | None:
@@ -451,9 +444,6 @@ class ThreadsAPI:
         # scrape that does both should not pay for two requests.
         self._profile_cache: dict[str, str] = {}
         self._lsd: str | None = None
-        # The revision the profile page was built with. Beats the hardcoded
-        # __rev, which was several million behind by the time this was written.
-        self._server_revision: str | None = None
         # Replayable GraphQL request parameters, discovered from the web app.
         # Keyed by username: the captured variables carry the userID of the
         # account the browser queried, which is only valid for that profile.
@@ -665,15 +655,12 @@ class ThreadsAPI:
         if key in self._template_attempted:
             return None
         self._template_attempted.add(key)
-        self._template_attempts += 1
-        if self._template_attempts > _MAX_TEMPLATE_ATTEMPTS:
-            # Two captures, two rejections: something structural changed.
-            # Stop here rather than looping against Threads.
-            _warn(
-                "the GraphQL query was refused again after recapturing its id; "
-                "stopping the fast path for this run"
-            )
-            return None
+
+        # The two checks below abort without attempting anything, so they must
+        # come *before* the budget is spent. Counting them turned a batch of
+        # anonymous profiles into "the query was refused again after
+        # recapturing its id" — which never happened, there was simply no
+        # session to capture from and no browser to capture with.
 
         # Only a logged-in browser issues the media query. Verified: an
         # anonymous profile page fires only fetchBarcelonaExperimentQuery, so
@@ -704,6 +691,20 @@ class ThreadsAPI:
                 "the query parameters cannot be discovered. Install "
                 "'threadstractormf[browser]' and 'playwright install chromium' to "
                 "enable the fast API path."
+            )
+            return None
+
+        # Everything above only checks whether an attempt is possible; from
+        # here the browser really launches, so this is where the budget is
+        # spent. Global on purpose: a batch scrape must not spend unbounded
+        # time in the browser, however many profiles it visits.
+        self._template_attempts += 1
+        if self._template_attempts > _MAX_TEMPLATE_ATTEMPTS:
+            # Two captures, two rejections: something structural changed.
+            # Stop here rather than looping against Threads.
+            _warn(
+                "the GraphQL query was refused again after recapturing its id; "
+                "stopping the fast path for this run"
             )
             return None
 
@@ -745,13 +746,11 @@ class ThreadsAPI:
 
         html = self._profile_html(username)
         if html is not None:
-            user_id, lsd, _pic, rev = _parse_profile_html(html)
+            user_id, lsd, _pic = _parse_profile_html(html)
             if user_id:
                 self._user_id_cache[username] = user_id
                 if lsd:
                     self._lsd = lsd
-                if rev:
-                    self._server_revision = rev
                 return user_id
             # No userID: fall through to the DOM scraper rather than burning a
             # GraphQL call on an id we already know is unreliable.
@@ -763,11 +762,9 @@ class ThreadsAPI:
             html = self._profile_html(username)
             user_id = lsd = pic = None
             if html is not None:
-                user_id, lsd, pic, rev = _parse_profile_html(html)
+                user_id, lsd, pic = _parse_profile_html(html)
                 if lsd:
                     self._lsd = lsd
-                if rev:
-                    self._server_revision = rev
                 # Seed the cache so get_posts() can skip its own page fetch.
                 if user_id:
                     self._user_id_cache[username] = user_id
@@ -1124,21 +1121,47 @@ class ThreadsAPI:
         Split out of :meth:`get_posts` so the stale-template retry can re-enter
         it from scratch with a freshly captured template, instead of resuming a
         walk whose cursor belongs to parameters that no longer resolve.
+
+        ``userID`` is read from the captured template rather than from the
+        profile HTML: the HTML carries several ``userID`` fields and the first
+        one is the *viewer's own* account, not the profile being read — using it
+        made every GraphQL query ask for the wrong account, which Threads
+        refuses with ``execution error``. The template's variables name the
+        account the browser actually queried, which is by construction the
+        right one.
         """
-        # GraphQL path: walk the `after` cursor until the profile is
-        # exhausted or `limit` is met. A single request only ever
-        # returns _PAGE_SIZE posts, so without this loop `--limit 50`
-        # silently truncated to one page.
-        # ``userID`` comes from the captured template, not from the profile HTML.
-        # The HTML carries several ``userID`` fields and the first one is the
-        # *viewer's own* account, not the profile being read — using it made
-        # every GraphQL query ask for the wrong account, which Threads refuses
-        # with ``execution error``. The template's variables name the account
-        # the browser actually queried, which is by construction the right one.
         template = self._ensure_template(username)
-        target_id = (template.variables.get("userID") or template.user_id) if template else ""
-        if not target_id:
-            target_id = user_id
+        if template is None:
+            # No template and no way to get one: the walk cannot start. Report
+            # the real reason (already warned by _ensure_template) rather than
+            # sending a request known to fail, and let the caller fall back.
+            if not report.api_error:
+                report.api_error = (
+                    "no GraphQL request template available and discovery is "
+                    "unavailable"
+                )
+            raise _NonJsonResponse(report.api_error)
+
+        # The client bakes X-FB-LSD in at construction, and the lsd it needs
+        # comes from this template — discovered *after* the first request of the
+        # process already built the client (the profile fetch runs first).
+        # Rebuilding is how the new lsd is picked up. Patching the header dict
+        # in place only worked for httpx, and CurlClient (--impersonate) has no
+        # ``headers`` at all, which raised AttributeError on the path the README
+        # recommends for the WAF.
+        #
+        # Once per walk, not per page: this used to sit inside the loop below,
+        # so a 200-page crawl paid 200 TLS handshakes for no reason.
+        #
+        # Only a client this class built is replaced. An injected one (tests, a
+        # caller supplying their own session) is left alone: discarding it would
+        # silently swap a mocked transport for a real one and send the request
+        # to the network.
+        if self._client is not None and self._owns_client:
+            self._client.close()
+            self._client = None
+
+        target_id = template.variables.get("userID") or template.user_id or user_id
         if not target_id:
             raise _NonJsonResponse("could not determine the target account id")
 
@@ -1165,35 +1188,6 @@ class ThreadsAPI:
             page_budget = min(_MAX_PAGES, max(1, -(-limit // _PAGE_SIZE) + 2))
         for _ in range(page_budget):
             variables["after"] = cursor
-            if template is None:
-                # No template and no way to get one: the walk cannot
-                # start. Degrade to the DOM scraper with an actionable
-                # message instead of sending a request known to fail.
-                # Only claim this as the api_error when nothing better is
-                # already known — a prior page may have failed for a real
-                # reason worth reporting.
-                if not report.api_error:
-                    report.api_error = (
-                        "no GraphQL request template available and discovery "
-                        "is unavailable; install the browser extra to enable "
-                        "automatic recovery"
-                    )
-                raise _NonJsonResponse(report.api_error)
-            # The client bakes headers in at construction, and the X-FB-LSD it
-            # carries comes from the template — which is discovered *after* the
-            # first request already built the client (the profile fetch runs
-            # first). Patching the header dict in place was tried and only
-            # worked for httpx: CurlClient, used by --impersonate, exposes no
-            # ``headers`` at all, so it raised AttributeError on the
-            # documented WAF-circumvention path.
-            #
-            # Only a client this class built is replaced. An injected one (a
-            # MockTransport in tests, a caller supplying their own session) must
-            # be left alone: discarding it would silently swap a mocked
-            # transport for a real one and send the request to the network.
-            if self._client is not None and self._owns_client:
-                self._client.close()
-                self._client = None
             body = build_body(template, variables)
             resp = self._request_with_rate_limit("POST", template.endpoint, data=body)
             report.pages_fetched += 1

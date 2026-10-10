@@ -623,6 +623,37 @@ def test_the_global_attempt_budget_still_bounds_a_batch_scrape(monkeypatch, tmp_
     assert calls["n"] <= _MAX_TEMPLATE_ATTEMPTS, calls
 
 
+def test_a_batch_of_anonymous_profiles_does_not_claim_the_query_was_refused(
+    capsys, monkeypatch, tmp_path
+):
+    """A batch with no session must not burn the attempt budget.
+
+    The budget counts browser launches. Spending it on profiles that were never
+    even attemptable — no session to capture from — made the third one warn
+    that "the query was refused again after recapturing its id", which never
+    happened.
+    """
+    import http.cookiejar as cj
+
+    monkeypatch.setattr(disc, "_CACHE_SUBDIR", str(tmp_path / "cache"))
+    api = ThreadsAPI(cj.CookieJar(), rate_limit_config=rl.RateLimitConfig(enabled=False))
+    api._resolve_user_id = lambda _u: None
+    api._fetch_posts_via_playwright = lambda _u, _l: []
+
+    # Each run's stderr is collected as it is produced. Draining with
+    # capsys.readouterr() would reset the buffer, so the parts are kept and
+    # joined below.
+    parts = []
+    for name in ("a", "b", "c", "d"):
+        api.get_posts(name, limit=1)
+        parts.append(capsys.readouterr().err)
+
+    err = "".join(parts)
+    assert api._template_attempts == 0, api._template_attempts
+    assert "refused again" not in err, err
+    assert "no session cookies" in err
+
+
 def test_an_injected_client_is_never_discarded_when_the_template_arrives(
     monkeypatch, tmp_path
 ):
@@ -664,6 +695,7 @@ class _HeaderlessClient:
     def __init__(self, pages):
         self.pages = pages
         self.n = 0
+        self.closes = 0
         self.closed = False
 
     def request(self, _method, _url, **_kwargs):
@@ -679,6 +711,7 @@ class _HeaderlessClient:
         return resp
 
     def close(self):
+        self.closes += 1
         self.closed = True
 
 
@@ -693,6 +726,73 @@ def test_the_impersonation_client_has_no_headers_to_patch(monkeypatch, tmp_path)
 
     assert not hasattr(CurlClient, "headers")
     assert {"close", "request", "stream"} <= set(dir(CurlClient))
+
+
+def test_the_client_is_rebuilt_once_per_walk_not_once_per_page(monkeypatch, tmp_path):
+    """A 200-page crawl must not pay 200 TLS handshakes.
+
+    The client carries X-FB-LSD from the template, and discovery runs after the
+    profile fetch already built a client — so one rebuild is needed to pick the
+    captured lsd up. It used to sit inside the page loop, which closed and
+    rebuilt the connection on every single page: with `_owns_client` set on the
+    new one each time, the condition held forever.
+    """
+    monkeypatch.setattr(disc, "_CACHE_SUBDIR", str(tmp_path / "cache"))
+    pages = [_page([f"P{i}"], has_next=True, cursor=f"c{i}") for i in range(6)]
+
+    api = ThreadsAPI(session_cookies(), rate_limit_config=rl.RateLimitConfig(enabled=False))
+    api._resolve_user_id = lambda _u: "999"
+    client = _HeaderlessClient(pages)
+    def _fake_get_client():
+        # Mirrors the real _get_client, which *stores* the client: the rebuild
+        # guard reads self._client, so a mock that merely returns one would
+        # leave it None and silently disable the check being tested.
+        api._client = client
+        return client
+
+    monkeypatch.setattr(api, "_get_client", _fake_get_client)
+    api._client = client
+    api._owns_client = True  # as if this class had built it
+    api._templates["user"] = _template(doc_id="D", lsd="L")
+    api._fetch_posts_via_playwright = lambda _u, _l: []
+
+    posts = api.get_posts("user", limit=None)
+
+    assert posts, "the walk should have produced posts"
+    # Exactly one rebuild: the client built for the profile fetch carries the
+    # old lsd, and the template's lsd has to replace it. With the rebuild inside
+    # the page loop this was one close per page, i.e. a fresh TLS handshake for
+    # every request of a 200-page crawl.
+    assert client.closes == 1, client.closes
+    assert client.n >= len(pages), "every page must be served"
+
+
+def test_an_injected_client_is_still_never_rebuilt(monkeypatch, tmp_path):
+    """Rebuilding once per walk is still wrong for a client we do not own."""
+    monkeypatch.setattr(disc, "_CACHE_SUBDIR", str(tmp_path / "cache"))
+    pages = [_page(["P1"], has_next=True, cursor="c1"), _page(["P2"])]
+
+    api = ThreadsAPI(session_cookies(), rate_limit_config=rl.RateLimitConfig(enabled=False))
+    api._resolve_user_id = lambda _u: "999"
+    client = _HeaderlessClient(pages)
+    def _fake_get_client():
+        # Mirrors the real _get_client, which *stores* the client: the rebuild
+        # guard reads self._client, so a mock that merely returns one would
+        # leave it None and silently disable the check being tested.
+        api._client = client
+        return client
+
+    monkeypatch.setattr(api, "_get_client", _fake_get_client)
+    api._client = client
+    api._owns_client = False  # injected: not ours to touch
+    api._templates["user"] = _template(doc_id="D", lsd="L")
+    api._fetch_posts_via_playwright = lambda _u, _l: []
+
+    api.get_posts("user", limit=None)
+
+    assert api._client is client
+    assert client.closes == 0, "an injected client must never be closed"
+    assert client.n == 2
 
 
 def test_a_headerless_client_still_gets_a_refreshed_lsd(monkeypatch, tmp_path):
@@ -718,7 +818,14 @@ def test_a_headerless_client_still_gets_a_refreshed_lsd(monkeypatch, tmp_path):
     # Stand in for the CurlClient that _get_client would build, and mark it as
     # owned so the refresh path actually runs.
     client = _HeaderlessClient([_page(["HH1", "HH2"])])
-    monkeypatch.setattr(api, "_get_client", lambda: client)
+    def _fake_get_client():
+        # Mirrors the real _get_client, which *stores* the client: the rebuild
+        # guard reads self._client, so a mock that merely returns one would
+        # leave it None and silently disable the check being tested.
+        api._client = client
+        return client
+
+    monkeypatch.setattr(api, "_get_client", _fake_get_client)
     api._client = client
     api._owns_client = True
 

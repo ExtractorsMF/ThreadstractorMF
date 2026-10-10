@@ -36,6 +36,18 @@ import pytest
 from threadstractormf._discovery import MEDIA_QUERY_NAME, RequestTemplate
 
 
+def session_cookies(sessionid: str = "test-session"):
+    """A CookieJar that looks logged in.
+
+    Discovery is gated on a session cookie, because Threads only issues the
+    media query to a logged-in browser. A plain dict would not do: the
+    fingerprinting walks Cookie objects, and iterating a dict yields its keys.
+    """
+    from threadstractormf.auth import load_cookies_dict
+
+    return load_cookies_dict({"csrftoken": "x", "sessionid": sessionid})
+
+
 def seed_template(api: Any, doc_id: str = "123456789", username: str = "user") -> Any:
     """Attach a usable request template to a mocked ThreadsAPI.
 

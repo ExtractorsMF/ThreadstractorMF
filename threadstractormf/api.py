@@ -459,9 +459,10 @@ class ThreadsAPI:
         # account the browser queried, which is only valid for that profile.
         self._templates: dict[str, RequestTemplate] = {}
         self._template: RequestTemplate | None = None
-        self._template_attempted = False
+        self._template_attempted: set[str] = set()
         self._template_attempts = 0
         self._fingerprint_cache: str | None = None
+        self._has_session_cache: bool | None = None
         # Counters for the most recent get_posts() call, so the CLI can report a
         # truncated scrape instead of ending in silence.
         self.last_report = ScrapeReport()
@@ -607,6 +608,16 @@ class ThreadsAPI:
         self._profile_cache[username] = html
         return html
 
+    def _has_session(self) -> bool:
+        """Whether these cookies identify a logged-in account.
+
+        Gates browser-based discovery, which can only capture what a
+        logged-in page actually issues.
+        """
+        if self._has_session_cache is None:
+            self._has_session_cache = session_fingerprint(self.cookies) != "anonymous"
+        return self._has_session_cache
+
     def _fingerprint(self) -> str:
         """Cache key for the current session's captured template.
 
@@ -622,12 +633,13 @@ class ThreadsAPI:
 
         Order: in-memory, then disk cache, then a browser capture.
 
-        ``_template_failures`` bounds the capture attempts. It exists so that
-        "the browser is missing" fails once and fast instead of stalling on
-        every page, while still leaving room for the retry that follows a
-        rejection: the first capture may fail simply because there was no cache,
-        the second because the server refused what we sent, and those are
-        different problems that happen to share a remedy.
+        Two separate bounds, deliberately different in scope:
+
+        * the per-profile guard stops the *same* target being re-attempted
+          within one scrape, so "the browser is missing" fails once and fast
+          instead of stalling on every page;
+        * :attr:`_template_attempts` is global, because a batch scrape across
+          many profiles must still not spend unbounded time in the browser.
         """
         key = username.lstrip("@").split("/")[0]
         cached_in_memory = self._templates.get(key)
@@ -645,9 +657,14 @@ class ThreadsAPI:
             self._template = cached
             return cached
 
-        if self._template_attempted:
+        # Per profile, not per instance. A scraper reused across several
+        # accounts must be able to discover for each one: a capture that
+        # failed (or was skipped) for @a says nothing about @b. As a plain
+        # flag this locked discovery out after the first target, so every
+        # subsequent profile silently fell back to the DOM path.
+        if key in self._template_attempted:
             return None
-        self._template_attempted = True
+        self._template_attempted.add(key)
         self._template_attempts += 1
         if self._template_attempts > _MAX_TEMPLATE_ATTEMPTS:
             # Two captures, two rejections: something structural changed.
@@ -655,6 +672,24 @@ class ThreadsAPI:
             _warn(
                 "the GraphQL query was refused again after recapturing its id; "
                 "stopping the fast path for this run"
+            )
+            return None
+
+        # Only a logged-in browser issues the media query. Verified: an
+        # anonymous profile page fires only fetchBarcelonaExperimentQuery, so
+        # launching a browser to capture the media query provably finds
+        # nothing — about 15 wasted seconds on every anonymous scrape, for a
+        # path that then falls back to the DOM scraper anyway. The captured
+        # lsd and fb_dtsg are session-bound too, so a template captured for
+        # one account cannot be replayed by another (measured: execution
+        # error). Anonymous scraping keeps using the DOM path.
+        if not self._has_session():
+            _warn(
+                "no GraphQL template cached and no session cookies, so the query "
+                "cannot be discovered (Threads only issues it to a logged-in "
+                "browser); using the DOM scraper, which is slower but works "
+                "anonymously. Pass --cookies or --cookies-from-browser for the "
+                "fast API path."
             )
             return None
 
@@ -692,15 +727,16 @@ class ThreadsAPI:
         Both the in-memory copy and the disk cache go, so the next attempt
         rediscovers rather than replaying a doc_id known to be dead.
 
-        The attempt guard is reset as well: this is the server telling us the
-        id is wrong, which is a *different* situation from having no way to get
-        one, and it deserves its own capture. :attr:`_template_attempts` is
-        what stops that from looping.
+        The per-profile guard is cleared as well: this is the server telling us
+        the id is wrong, which is a *different* situation from having no way to
+        get one, and it deserves its own capture. :attr:`_template_attempts` is
+        what stops that from looping, and it stays global on purpose — a scrape
+        must not spend unbounded time in the browser across many profiles.
         """
         username = self._template.username if self._template else ""
         self._templates.pop(username, None)
         self._template = None
-        self._template_attempted = False
+        self._template_attempted.discard(username)
         clear_template(self._fingerprint(), username)
 
     def _resolve_user_id(self, username: str) -> str:
@@ -1071,7 +1107,7 @@ class ThreadsAPI:
     def _walk_graphql(
         self,
         username: str,
-        user_id: str,
+        user_id: str | None,
         *,
         limit: int | None,
         exclude_reposts: bool,
@@ -1271,9 +1307,37 @@ class ThreadsAPI:
             try:
                 user_id = self._resolve_user_id(username)
             except Exception as exc:
-                user_id = None
+                # Not fatal. An unauthenticated profile page carries no
+                # userID at all (Threads renders it client-side), and this
+                # guard used to send every anonymous scrape straight to the
+                # DOM path without ever trying discovery — which *can* resolve
+                # the account on its own, because the captured variables name
+                # the profile the browser actually visited.
                 report.api_error = f"userID: {exc.__class__.__name__}"
-            if user_id:
+            try:
+                out = self._walk_graphql(
+                    username,
+                    user_id,
+                    limit=limit,
+                    exclude_reposts=exclude_reposts,
+                    report=report,
+                    collected=collected,
+                )
+            except _StaleTemplate:
+                # The cached doc_id was refused. This is the whole reason
+                # the template is captured rather than hardcoded: capture a
+                # fresh one and walk again. Bounded by
+                # _MAX_TEMPLATE_ATTEMPTS — a template that fails twice is
+                # not going to fix itself.
+                _warn(
+                    "the cached GraphQL query id is no longer accepted; "
+                    "capturing the current one and retrying"
+                )
+                # Nothing was collected under the dead id, and the new walk
+                # starts from the first page, so the old list is dropped
+                # rather than merged: the ids may not even mean the same
+                # thing under a different query revision.
+                collected.clear()
                 try:
                     out = self._walk_graphql(
                         username,
@@ -1283,51 +1347,27 @@ class ThreadsAPI:
                         report=report,
                         collected=collected,
                     )
-                except _StaleTemplate:
-                    # The cached doc_id was refused. This is the whole reason
-                    # the template is captured rather than hardcoded: capture a
-                    # fresh one and walk again. Bounded by
-                    # _MAX_TEMPLATE_ATTEMPTS — a template that fails twice is
-                    # not going to fix itself.
+                    report.api_error = ""
+                except Exception as exc:
+                    # Keep the *original* rejection as the reported cause:
+                    # "we could not rediscover a working id" is a detail of
+                    # the recovery, while "the server refused the query" is
+                    # what the user needs to read.
+                    detail = exc.__class__.__name__
                     _warn(
-                        "the cached GraphQL query id is no longer accepted; "
-                        "capturing the current one and retrying"
+                        f"the GraphQL query is still rejected after recapture "
+                        f"({detail}); falling back"
                     )
-                    # Nothing was collected under the dead id, and the new walk
-                    # starts from the first page, so the old list is dropped
-                    # rather than merged: the ids may not even mean the same
-                    # thing under a different query revision.
-                    collected.clear()
-                    try:
-                        out = self._walk_graphql(
-                            username,
-                            user_id,
-                            limit=limit,
-                            exclude_reposts=exclude_reposts,
-                            report=report,
-                            collected=collected,
+                    out = []
+                    if not report.api_error:
+                        report.api_error = (
+                            "GraphQL query rejected and no replacement "
+                            "doc_id could be captured"
                         )
-                        report.api_error = ""
-                    except Exception as exc:
-                        # Keep the *original* rejection as the reported cause:
-                        # "we could not rediscover a working id" is a detail of
-                        # the recovery, while "the server refused the query" is
-                        # what the user needs to read.
-                        detail = exc.__class__.__name__
-                        _warn(
-                            f"the GraphQL query is still rejected after recapture "
-                            f"({detail}); falling back"
-                        )
-                        out = []
-                        if not report.api_error:
-                            report.api_error = (
-                                "GraphQL query rejected and no replacement "
-                                "doc_id could be captured"
-                            )
 
-                if out:
-                    _finish_report(report, out)
-                    return out
+            if out:
+                _finish_report(report, out)
+                return out
         except Exception as exc:
             # The cursor walk can fail several pages in. Anything already
             # collected is still valid output, so keep it and only fall back to

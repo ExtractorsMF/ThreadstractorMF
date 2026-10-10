@@ -59,6 +59,11 @@ _GRAPHQL_PATH = "https://www.threads.com/graphql/query"
 _CACHE_SUBDIR = "threadstractormf"
 _CACHE_FILENAME = "request_template.json"
 
+# How long an unused template is kept. The tokens in it are session-bound and
+# therefore dead long before this, so it is a grace period for convenience,
+# not for correctness: recapturing costs one browser launch.
+_CACHE_MAX_AGE_DAYS = 14
+
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -249,6 +254,12 @@ def save_template(
     reading mid-write cannot leave truncated JSON behind. Parallel scrapes on
     one machine are normal for scrapmf, and a corrupt cache would send every
     one of them back to the browser.
+
+    Old templates are pruned: one file per (session, account), so every
+    logout/login and every new profile adds a file, and nothing was ever
+    removing them. The tokens in them are dead by then, so they are pure
+    clutter. Only files untouched for ``_CACHE_MAX_AGE_DAYS`` go, and the one
+    just written is excluded from the sweep.
     """
     path = _cache_path(fingerprint, username or template.username)
     try:
@@ -261,7 +272,33 @@ def save_template(
             pass
         os.replace(tmp, path)
     except OSError:
-        pass
+        return
+    _prune_old_templates(path)
+
+
+def _prune_old_templates(keep: Path) -> None:
+    """Delete cached templates nobody has looked at in a while.
+
+    Best effort and deliberately conservative: an error here must never matter
+    to a scrape that already has its template, and a file is only removed once
+    it is clearly stale. Anything that is not a plain file is left alone.
+    """
+    cutoff = time.time() - _CACHE_MAX_AGE_DAYS * 86400
+    try:
+        entries = list(keep.parent.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if entry == keep:
+            continue
+        try:
+            if not entry.is_file():
+                continue
+            if entry.stat().st_mtime > cutoff:
+                continue
+            entry.unlink()
+        except OSError:
+            continue
 
 
 def clear_template(fingerprint: str = "anonymous", username: str = "") -> None:

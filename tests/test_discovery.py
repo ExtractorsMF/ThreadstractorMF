@@ -19,12 +19,14 @@ Two things are covered here:
 """
 
 import json
+import os
 import sys
 import types
 from urllib.parse import urlencode
 
 import httpx
 import pytest
+from conftest import session_cookies
 
 import threadstractormf._discovery as disc
 import threadstractormf.rate_limit as rl
@@ -400,7 +402,59 @@ def test_an_unwritable_cache_does_not_break_a_working_scrape(tmp_path, monkeypat
     monkeypatch.setattr(disc, "_CACHE_SUBDIR", str(tmp_path / "ro"))
     (tmp_path / "ro").write_text("a file, not a directory", encoding="utf-8")
     # Must not raise: the template still works in memory for this run.
-    save_template(RequestTemplate(params={"doc_id": "1", "lsd": "x"}))
+    save_template(_template())
+
+
+def test_stale_templates_are_pruned_when_a_new_one_is_saved(tmp_path, monkeypatch):
+    """One file per (session, account), so runs accumulate forever.
+
+    Every logout/login and every new profile adds a file whose tokens are
+    already dead, and nothing removed them. The freshly written template is
+    never swept along.
+    """
+    import time as _time
+
+    monkeypatch.setattr(disc, "_CACHE_SUBDIR", str(tmp_path / "cache"))
+    fp = disc.session_fingerprint(session_cookies())
+    save_template(_template(doc_id="OLD", lsd="old", username="old"), fp, "old")
+
+    cache = disc._cache_path(fp, "old").parent
+    # Backdate every existing template: ours is written after the sweep.
+    stale = _time.time() - 100 * 86400
+    for f in cache.iterdir():
+        os.utime(f, (stale, stale))
+
+    save_template(_template(doc_id="NEW", lsd="new", username="new"), fp, "new")
+
+    remaining = {p.name for p in cache.iterdir()}
+    assert disc._cache_path(fp, "new").name in remaining, "must survive"
+    assert disc._cache_path(fp, "old").name not in remaining, "stale one goes"
+
+
+def test_a_recently_used_template_is_not_pruned(tmp_path, monkeypatch):
+    """The sweep is conservative: only clearly-unused files are removed."""
+    monkeypatch.setattr(disc, "_CACHE_SUBDIR", str(tmp_path / "cache"))
+    save_template(_template(username="keep"))
+    save_template(_template(username="other"))
+
+    cache = disc._cache_path("fp", "keep").parent
+    assert len(list(cache.iterdir())) == 2, "neither is old enough to prune"
+
+
+def test_pruning_ignores_directories_and_unrelated_files(tmp_path, monkeypatch):
+    """Only plain files this module wrote are ever candidates."""
+    monkeypatch.setattr(disc, "_CACHE_SUBDIR", str(tmp_path / "cache"))
+    cache = disc._cache_path("fp", "u").parent
+    cache.mkdir(parents=True, exist_ok=True)
+    subdir = cache / "not-a-template"
+    subdir.mkdir()
+    other = cache / "notes.txt"
+    other.write_text("leave me", encoding="utf-8")
+
+    save_template(_template(username="u"))
+
+    assert subdir.is_dir()
+    assert other.exists()
 
 
 # --- automatic recovery ---------------------------------------------------
@@ -460,11 +514,113 @@ def _api(responses, monkeypatch, tmp_path):
             headers={"content-type": "application/json"},
         )
 
-    api = ThreadsAPI({"csrftoken": "x"}, rate_limit_config=rl.RateLimitConfig(enabled=False))
+    # A session cookie is required: browser-based discovery is skipped without
+    # one, because Threads only issues the media query to a logged-in browser.
+    api = ThreadsAPI(session_cookies(), rate_limit_config=rl.RateLimitConfig(enabled=False))
     api._resolve_user_id = lambda _u: "999"
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
     api._test_calls = calls
     return api
+
+
+def test_a_second_profile_can_discover_after_the_first_one_did(
+    monkeypatch, tmp_path
+):
+    """A scraper reused across accounts must discover for each one.
+
+    The guard against re-attempting a capture is per *profile*. As a single
+    instance-wide flag it locked discovery out after the first target, so a
+    batch scrape silently sent every account after the first down the slow DOM
+    path — with nothing in the report to say the fast path had never even been
+    tried for them.
+    """
+    monkeypatch.setattr(disc, "_CACHE_SUBDIR", str(tmp_path / "cache"))
+    api = _api([_page(["AA1"], username="alice"), _page(["BB1"], username="bob")],
+               monkeypatch, tmp_path)
+    api._resolve_user_id = lambda _u: "999"
+    api._fetch_posts_via_playwright = lambda _u, _l: []
+
+    discovered = []
+
+    def fake_discover_and_cache(username, cookies):
+        discovered.append(username)
+        return RequestTemplate(
+            params={"doc_id": "D", "lsd": f"lsd-{username}"},
+            variables=_captured_vars(userID="999"),
+            username=username,
+            captured_at=1.0,
+        )
+
+    monkeypatch.setattr("threadstractormf.api.discover_and_cache", fake_discover_and_cache)
+
+    first = api.get_posts("alice", limit=5)
+    second = api.get_posts("bob", limit=5)
+
+    assert discovered == ["alice", "bob"], discovered
+    assert len(first) == 1 and len(second) == 1
+    # Neither may have degraded: the whole point is the fast path for both.
+    assert api.last_report.used_fallback is False
+
+
+def test_the_attempt_guard_still_stops_retrying_the_same_profile(
+    monkeypatch, tmp_path
+):
+    """Per-profile must not become per-page: one failure, one attempt."""
+
+    monkeypatch.setattr(disc, "_CACHE_SUBDIR", str(tmp_path / "cache"))
+    api = _api([_page([])], monkeypatch, tmp_path)
+    api._resolve_user_id = lambda _u: "999"
+    api._fetch_posts_via_playwright = lambda _u, _l: []
+
+    calls = {"n": 0}
+
+    def fake_discover_and_cache(username, cookies):
+        calls["n"] += 1
+        raise RuntimeError("no query observed")
+
+    monkeypatch.setattr("threadstractormf.api.discover_and_cache", fake_discover_and_cache)
+
+    api.get_posts("alice", limit=None)
+    first = calls["n"]
+    assert first >= 1
+
+    # A second scrape of the same account must not launch the browser again.
+    api2 = _api([_page([])], monkeypatch, tmp_path)
+    api2._resolve_user_id = lambda _u: "999"
+    api2._fetch_posts_via_playwright = lambda _u, _l: []
+    api2._template_attempted.add("alice")
+    calls["n"] = 0
+    api2.get_posts("alice", limit=5)
+    assert calls["n"] == 0, "an already-attempted profile must not recapture"
+
+
+def test_the_global_attempt_budget_still_bounds_a_batch_scrape(monkeypatch, tmp_path):
+    """Per-profile guards must not add up to unbounded browser time."""
+
+    monkeypatch.setattr(disc, "_CACHE_SUBDIR", str(tmp_path / "cache"))
+    api = _api([_stale()], monkeypatch, tmp_path)
+    api._resolve_user_id = lambda _u: "999"
+    api._fetch_posts_via_playwright = lambda _u, _l: []
+
+    calls = {"n": 0}
+
+    def fake_discover_and_cache(username, cookies):
+        calls["n"] += 1
+        return RequestTemplate(
+            params={"doc_id": "BAD", "lsd": "x"},
+            variables=_captured_vars(userID="999"),
+            username=username,
+            captured_at=1.0,
+        )
+
+    monkeypatch.setattr("threadstractormf.api.discover_and_cache", fake_discover_and_cache)
+
+    for name in ("a", "b", "c", "d", "e"):
+        api.get_posts(name, limit=5)
+
+    from threadstractormf.api import _MAX_TEMPLATE_ATTEMPTS
+
+    assert calls["n"] <= _MAX_TEMPLATE_ATTEMPTS, calls
 
 
 def test_an_injected_client_is_never_discarded_when_the_template_arrives(
@@ -551,7 +707,7 @@ def test_a_headerless_client_still_gets_a_refreshed_lsd(monkeypatch, tmp_path):
     """
     monkeypatch.setattr(disc, "_CACHE_SUBDIR", str(tmp_path / "cache"))
     api = ThreadsAPI(
-        {"csrftoken": "x"},
+        session_cookies(),
         impersonate="chrome131",  # -> CurlClient, which has no .headers
         rate_limit_config=rl.RateLimitConfig(enabled=False),
     )
@@ -626,7 +782,8 @@ def test_the_stale_template_is_also_evicted_from_disk(monkeypatch, tmp_path):
     import threadstractormf.api as api_module
 
     api = _api([_stale(), _page(["BB1"])], monkeypatch, tmp_path)
-    save_template(_template(doc_id="DEAD", lsd="old", username="user"), username="user")
+    fp = disc.session_fingerprint(session_cookies())
+    save_template(_template(doc_id="DEAD", lsd="old", username="user"), fp, "user")
 
     monkeypatch.setattr(
         disc, "discover", lambda u, c: RequestTemplate(
@@ -640,7 +797,7 @@ def test_the_stale_template_is_also_evicted_from_disk(monkeypatch, tmp_path):
     api._fetch_posts_via_playwright = lambda _u, _l: []
     api.get_posts("user", limit=5)
 
-    on_disk = load_template(username="user")
+    on_disk = load_template(fp, "user")
     assert on_disk is not None
     assert on_disk.doc_id == "NEW"
 

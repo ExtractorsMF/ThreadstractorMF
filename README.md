@@ -283,6 +283,24 @@ behaviours coexist instead of one undoing the other.
 The scroll walk waits `3000ms` per step (jittered for the first few) and gives
 up only after 5 consecutive rounds with nothing new rendered.
 
+### Anonymous scraping cannot use the GraphQL path
+
+It is not worth trying, and the code says so instead of trying anyway.
+
+Measured: an anonymous profile page issues only
+`fetchBarcelonaExperimentQuery` — the media query never appears, so there is
+nothing for discovery to capture. And a template captured for one account
+cannot be replayed by another either: the captured `lsd` and `fb_dtsg` are
+bound to the session that produced them, which returns `execution error`.
+
+So when there is no session cookie the run skips discovery outright (a warning
+on stderr says why) and goes straight to the DOM scraper, which does work
+anonymously. That is what recovered the ~15s a naive "just try it" cost on
+every anonymous scrape.
+
+Consequence: `--cookies` or `--cookies-from-browser` is what unlocks the fast
+API path. Without one, the DOM path is the path.
+
 ## scrapmf Integration
 
 `gallery-dl` has no Threads support — `scrapmf` routes Threads URLs to `threadstractormf` provider.

@@ -7,13 +7,17 @@ file held live session cookies with ``0o644`` permissions — world readable —
 ``MozillaCookieJar`` also asserts that the include-subdomains flag agrees with
 the domain's leading dot, so a self-inconsistent export aborted the whole load.
 
-These tests pin the in-memory parser against the behaviour it replaced.
+These tests used to compare against a copy of the previous implementation kept
+in a gitignored file, which meant none of them ran in CI — a fresh checkout
+skipped the module entirely. Worse, that comparison asserted what the *old* code
+did rather than what this one must do, which is what let two of them fail on
+Python 3.14 for reasons unrelated to the loader. The behaviour is now pinned
+directly.
 """
 
 import http.cookiejar
-import importlib.util
-import pathlib
 import time
+import urllib.request
 
 import pytest
 
@@ -36,22 +40,7 @@ def _cookies(jar) -> dict[str, http.cookiejar.Cookie]:
     return {c.name: c for c in jar}
 
 
-# --- the reference implementation ------------------------------------------
-#
-# The previous implementation is loaded verbatim and used as the oracle, rather
-# than re-implementing it here: a hand-written copy can drift and stop proving
-# anything. It normalises into a temp file and hands that to MozillaCookieJar.
-
-_OLD = pathlib.Path(__file__).resolve().parents[1] / ".old_auth_for_tests.py"
-if not _OLD.exists():
-    pytest.skip("reference implementation not available", allow_module_level=True)
-
-_spec = importlib.util.spec_from_file_location("old_auth_for_tests", _OLD)
-old_auth = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(old_auth)  # type: ignore[union-attr]
-
-
-# --- equivalence -----------------------------------------------------------
+# --- the parser, against the format it must accept ---------------------------
 
 SAMPLE = (
     MAGIC + "\n"
@@ -64,47 +53,46 @@ SAMPLE = (
 )
 
 
-def test_matches_the_previous_implementation(tmp_path):
-    """Equivalence against the code this replaced, minus two deliberate fixes.
+def test_a_realistic_export_loads_every_cookie_it_contains(tmp_path):
+    """Every row of a normal export survives, with the right fields.
 
-    Differences, both corrections:
-
-    * ``expires="0"`` means *session cookie* in the Netscape format. The old code
-      stored it as the timestamp 0, and http.cookiejar then treated the cookie
-      as expired and refused to send it (see
-      :func:`test_session_cookies_are_actually_sent`). Here it becomes ``None``.
-    * ``#HttpOnly_`` was stripped by the normaliser and never reapplied, so the
-      flag was lost; it is preserved now.
+    This used to diff against a copy of the previous implementation, kept in a
+    gitignored file so that CI skipped the whole module. The comparison was also
+    the wrong shape: it asserted what the old code did, which is why two tests
+    in this file failed on 3.14 over interpreter behaviour rather than ours.
+    The contract is stated directly here instead.
     """
     f = _write(tmp_path, SAMPLE)
-    mine = _cookies(load_netscape_cookies(f))
-    theirs = _cookies(old_auth.load_netscape_cookies(f))
+    jar = _cookies(load_netscape_cookies(f))
 
-    assert set(mine) == set(theirs)
-    for name, cookie in theirs.items():
-        # `discard` and `expires` are left out: both are derived from the
-        # session/expiry handling this loader deliberately changed, and 3.14
-        # also derives `discard` differently. The two that matter for actually
-        # sending the cookie are asserted directly below and in
-        # :func:`test_session_cookies_are_actually_sent`.
-        for attr in (
-            "value", "domain", "domain_specified", "domain_initial_dot",
-            "path", "path_specified", "secure", "version",
-        ):
-            assert getattr(mine[name], attr) == getattr(cookie, attr), f"{name}.{attr}"
+    assert set(jar) == {"sessionid", "csrftoken", "hsid"}, set(jar)
 
-    # expires: 0 and "" both mean "session cookie" in the Netscape format and
-    # become None. Asserted on our loader only: whether a stored expires=0 is
-    # treated as expired depends on the interpreter (3.14 stopped doing it), so
-    # pinning the old implementation's behaviour here made this test fail for
-    # reasons that had nothing to do with our code.
-    # hsid is the session cookie in the sample (expires 0 -> None).
-    assert mine["hsid"].expires is None
-    # sessionid carries a real future expiry and must keep it verbatim.
-    assert mine["sessionid"].expires == theirs["sessionid"].expires
+    session = jar["sessionid"]
+    assert session.value == "V1"
+    assert session.domain == ".threads.net"
+    assert session.path == "/"
+    assert session.secure is True
+    # A real future expiry is kept verbatim.
+    assert session.expires == 2147483647
 
-    # HttpOnly: lost before, kept now
-    assert mine["hsid"]._rest.get("HttpOnly") == ""
+    csrf = jar["csrftoken"]
+    assert csrf.value == "V2"
+    assert csrf.domain == ".threads.com"
+    # Not secure: the export says FALSE, and upgrading it would send it to
+    # plaintext when Threads itself does not.
+    assert csrf.secure is False
+
+    # ``#HttpOnly_`` rows load and keep the flag. It was stripped by the old
+    # normaliser and never reapplied.
+    httponly = jar["hsid"]
+    assert httponly._rest.get("HttpOnly") == ""
+
+    # A session cookie: expires 0 means "session", not "expired in 1970".
+    assert httponly.expires is None
+    assert not httponly.is_expired()
+
+    # A line with no tabs at all is skipped, not fatal: real exports carry junk.
+    assert "malformed-line-without-tabs" not in jar
 
 
 def test_session_cookies_are_actually_sent(tmp_path):
@@ -120,7 +108,6 @@ def test_session_cookies_are_actually_sent(tmp_path):
     ``expires=0`` as expired, so the "before" behaviour vanished without any
     change on our side. The requirement is now stated directly instead.
     """
-    import urllib.request
 
     body = MAGIC + "\n.threads.net\tTRUE\t/\tTRUE\t0\tsessionid\tV1\n"
     f = _write(tmp_path, body)
@@ -136,13 +123,18 @@ def test_session_cookies_are_actually_sent(tmp_path):
     assert not session.is_expired()
 
 
-def test_matches_the_previous_implementation_on_space_separated(tmp_path):
+def test_space_separated_rows_load_too(tmp_path):
+    """Not every export uses tabs; some use spaces.
+
+    Reimplemented here rather than compared against the old loader: real
+    exporters disagree on this, and the requirement is that both shapes work.
+    """
     body = MAGIC + "\n.threads.net TRUE / TRUE 2147483647 sessionid V1\n"
     f = _write(tmp_path, body)
-    mine = _cookies(load_netscape_cookies(f))
-    theirs = _cookies(old_auth.load_netscape_cookies(f))
-    assert set(mine) == set(theirs) == {"sessionid"}
-    assert mine["sessionid"].value == theirs["sessionid"].value == "V1"
+    jar = _cookies(load_netscape_cookies(f))
+
+    assert set(jar) == {"sessionid"}
+    assert jar["sessionid"].value == "V1"
 
 
 def test_session_and_httponly_cookies_survive(tmp_path):

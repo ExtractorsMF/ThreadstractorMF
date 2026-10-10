@@ -82,44 +82,58 @@ def test_matches_the_previous_implementation(tmp_path):
 
     assert set(mine) == set(theirs)
     for name, cookie in theirs.items():
+        # `discard` and `expires` are left out: both are derived from the
+        # session/expiry handling this loader deliberately changed, and 3.14
+        # also derives `discard` differently. The two that matter for actually
+        # sending the cookie are asserted directly below and in
+        # :func:`test_session_cookies_are_actually_sent`.
         for attr in (
             "value", "domain", "domain_specified", "domain_initial_dot",
-            "path", "path_specified", "secure", "discard", "version",
+            "path", "path_specified", "secure", "version",
         ):
             assert getattr(mine[name], attr) == getattr(cookie, attr), f"{name}.{attr}"
 
-    # expires: 0 and "" both become None (session cookie), the old code kept 0
+    # expires: 0 and "" both mean "session cookie" in the Netscape format and
+    # become None. Asserted on our loader only: whether a stored expires=0 is
+    # treated as expired depends on the interpreter (3.14 stopped doing it), so
+    # pinning the old implementation's behaviour here made this test fail for
+    # reasons that had nothing to do with our code.
+    # hsid is the session cookie in the sample (expires 0 -> None).
     assert mine["hsid"].expires is None
-    assert theirs["hsid"].expires == 0
+    # sessionid carries a real future expiry and must keep it verbatim.
     assert mine["sessionid"].expires == theirs["sessionid"].expires
 
     # HttpOnly: lost before, kept now
     assert mine["hsid"]._rest.get("HttpOnly") == ""
-    assert theirs["hsid"]._rest.get("HttpOnly") is None
 
 
 def test_session_cookies_are_actually_sent(tmp_path):
-    """The concrete payoff of the expires=0 fix.
+    """A session cookie must actually reach the request.
 
-    Netscape writes ``0`` for a session cookie. http.cookiejar reads a stored
-    ``expires=0`` as "expired in 1970" and silently omits the cookie from the
-    request, so such a cookie was loaded and then never sent.
+    Netscape writes ``0`` for a session cookie. Storing that as the timestamp
+    0 makes http.cookiejar read the cookie as expired and drop it, so it was
+    loaded and then never sent. The contract is that ``0`` means "session", and
+    the session id is what actually authenticates the API.
+
+    Previously this also asserted that the old implementation dropped it, which
+    stopped holding on 3.14: the interpreter no longer treats a stored
+    ``expires=0`` as expired, so the "before" behaviour vanished without any
+    change on our side. The requirement is now stated directly instead.
     """
     import urllib.request
 
     body = MAGIC + "\n.threads.net\tTRUE\t/\tTRUE\t0\tsessionid\tV1\n"
     f = _write(tmp_path, body)
 
-    mine = load_netscape_cookies(f)
+    jar = load_netscape_cookies(f)
     request = urllib.request.Request("https://www.threads.net/graphql/query")
-    mine.add_cookie_header(request)
+    jar.add_cookie_header(request)
     assert request.get_header("Cookie") == "sessionid=V1"
 
-    # the previous implementation loses it
-    old_jar = old_auth.load_netscape_cookies(f)
-    old_request = urllib.request.Request("https://www.threads.net/graphql/query")
-    old_jar.add_cookie_header(old_request)
-    assert old_request.get_header("Cookie") is None
+    # And it must not be treated as expired, which is the actual bug.
+    (session,) = [c for c in jar if c.name == "sessionid"]
+    assert session.expires is None
+    assert not session.is_expired()
 
 
 def test_matches_the_previous_implementation_on_space_separated(tmp_path):

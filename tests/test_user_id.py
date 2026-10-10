@@ -12,6 +12,7 @@ import json
 
 import httpx
 import pytest
+from conftest import seed_template
 
 import threadstractormf.rate_limit as rl
 from threadstractormf.api import ThreadsAPI, _parse_profile_html
@@ -39,6 +40,7 @@ HTML_WITHOUT_USERID = (
 def _api(handler, **cfg):
     api = ThreadsAPI({"csrftoken": "x"}, rate_limit_config=rl.RateLimitConfig(enabled=False, **cfg))
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
+    seed_template(api, username="u")
     return api
 
 
@@ -46,7 +48,7 @@ def _api(handler, **cfg):
 
 
 def test_parses_all_three_values_in_one_pass():
-    user_id, lsd, pic = _parse_profile_html(PROFILE_HTML)
+    user_id, lsd, pic, _rev = _parse_profile_html(PROFILE_HTML)
     assert user_id == USER_ID
     assert lsd == LSD
     assert pic == "https://scontent.cdninstagram.com/a.jpg&x=1"
@@ -54,7 +56,7 @@ def test_parses_all_three_values_in_one_pass():
 
 def test_profile_pic_url_is_fully_decoded():
     """\\u0026 and \\/ both have to go: a URL with either left in is unservable."""
-    _uid, _lsd, pic = _parse_profile_html(PROFILE_HTML)
+    _uid, _lsd, pic, _rev = _parse_profile_html(PROFILE_HTML)
     assert "\\u0026" not in pic
     assert "\\/" not in pic
     assert "scontent.cdninstagram.com" in pic
@@ -67,12 +69,12 @@ def test_parser_ignores_the_posts_pk():
 
 def test_parser_returns_none_without_userid():
     """The regression: it must NOT fall back to a pk, which is a post id here."""
-    assert _parse_profile_html(HTML_WITHOUT_USERID) == (None, None, None)
+    assert _parse_profile_html(HTML_WITHOUT_USERID) == (None, None, None, None)
 
 
 def test_parser_on_empty_input():
-    assert _parse_profile_html("") == (None, None, None)
-    assert _parse_profile_html("<html>nothing here</html>") == (None, None, None)
+    assert _parse_profile_html("") == (None, None, None, None)
+    assert _parse_profile_html("<html>nothing here</html>") == (None, None, None, None)
 
 
 def test_parser_tolerates_escaped_spacing():

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from conftest import seed_template
 
 import threadstractormf.rate_limit as rl
 from threadstractormf.api import ThreadsAPI, _require_playwright
@@ -120,6 +121,10 @@ def test_require_playwright_explains_the_install(monkeypatch):
 def _api(handler):
     api = ThreadsAPI({"csrftoken": "x"}, rate_limit_config=rl.RateLimitConfig(enabled=False))
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
+    # The doc_id is discovered and cached, not a constant, so a mocked
+    # transport has to be given one — otherwise the code under test goes
+    # looking for a browser instead of exercising the behaviour being tested.
+    seed_template(api, username="u")
     return api
 
 

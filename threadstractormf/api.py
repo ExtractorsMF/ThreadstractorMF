@@ -1,7 +1,10 @@
 """Threads GraphQL client — implemented via Brave sniffing of threads.com.
 
 Sniff: POST https://www.threads.com/graphql/query
-  doc_id=37598244946487292 (BarcelonaProfileMediaTabRefetchableDirectQuery)
+  form-encoded; the query is a *persisted* one, so the client sends no query
+  text, only fb_api_req_friendly_name + the doc_id that indexes the server-side
+  copy. Meta rotates that id whenever the query changes, so it is captured from
+  the live web app and cached rather than hardcoded — see _discovery.py.
   variables: {"after":null,"first":11,"userID":"<userID>", ...}
   headers: X-CSRFToken, X-IG-App-ID 238260118697367, X-ASBD-ID 129477,
   Referer threads.com, lsd, jazoest
@@ -13,7 +16,6 @@ post_id mapping: post.code if present else raw pk. Media.id = post_id / post_id_
 
 from __future__ import annotations
 
-import json
 import random
 import re
 import sys
@@ -31,6 +33,14 @@ from threadstractormf._backend import (
     is_transient_error,
     to_playwright_cookies,
 )
+from threadstractormf._discovery import (
+    RequestTemplate,
+    build_body,
+    clear_template,
+    discover_and_cache,
+    load_template,
+    session_fingerprint,
+)
 from threadstractormf.auth import get_csrf_token, load_netscape_cookies
 from threadstractormf.models import Media, MediaType, Post, Profile, extract_post_id
 from threadstractormf.rate_limit import (
@@ -40,7 +50,9 @@ from threadstractormf.rate_limit import (
     parse_retry_after,
 )
 
-_DOC_ID_MEDIA = "37598244946487292"
+# The GraphQL endpoint. The request's parameters — doc_id above all — are not
+# hardcoded here: see threadstractormf._discovery, which captures them from the
+# live web app. A hardcoded doc_id is exactly what rotted in 1.2.0.
 _GRAPHQL_URL = "https://www.threads.com/graphql/query"
 _X_IG_APP_ID = "238260118697367"
 _X_ASBD_ID = "129477"
@@ -55,6 +67,11 @@ _PAGE_SIZE = 12
 # walk is slow instead of risky. When a limit is set the budget is derived from
 # it instead (see get_posts).
 _MAX_PAGES = 200
+
+# How many times one scrape may capture a GraphQL request template: once to get
+# a starting point, once after the server rejected the one we had. Beyond that
+# the problem is not a rotated id, and retrying only hammers the endpoint.
+_MAX_TEMPLATE_ATTEMPTS = 2
 
 
 def _warn(message: str) -> None:
@@ -97,6 +114,16 @@ class ScrapeReport:
 
 class _NonJsonResponse(Exception):
     """The GraphQL endpoint answered with the web app instead of JSON."""
+
+
+class _StaleTemplate(Exception):
+    """The captured request template no longer resolves; rediscover it.
+
+    Distinct from every other failure because it is *recoverable*: the cached
+    doc_id is simply out of date, and capturing a fresh one is enough. Raising
+    here rather than silently retrying keeps the recovery in one place, where it
+    can be bounded — one rediscovery per scrape, never a loop.
+    """
 
 
 def _finish_report(report: ScrapeReport, posts: list[Any]) -> None:
@@ -218,8 +245,8 @@ def _pick_best_video(versions: Any) -> str | None:
     return str(url) if url else None
 
 
-def _parse_profile_html(html: str) -> tuple[str | None, str | None, str | None]:
-    """Extract ``(user_id, lsd, profile_pic_url)`` from a profile page.
+def _parse_profile_html(html: str) -> tuple[str | None, str | None, str | None, str | None]:
+    """Extract ``(user_id, lsd, profile_pic_url, server_revision)`` from a page.
 
     A single pass over the document, shared by ``_resolve_user_id`` and
     ``get_profile`` so one page fetch serves both.
@@ -233,14 +260,30 @@ def _parse_profile_html(html: str) -> tuple[str | None, str | None, str | None]:
     user_id = None
     lsd = None
     pic = None
+    server_revision = None
 
     m = re.search(r'"userID"\s*:\s*"(\d+)"', html)
     if m:
         user_id = m.group(1)
 
-    m = re.search(r'"lsd"\s*:\s*"([^"]+)"', html)
+    # Threads stopped shipping ``"lsd":"<token>"`` and now nests it in the
+    # Relay require payload as ``["LSD",[],{"token":"<token>"},<prio>]``. The
+    # old regex silently matched nothing, so every request went out with an
+    # empty X-FB-LSD and the query was rejected. Both shapes are accepted
+    # because which one ships depends on the rollout, not on our side.
+    m = re.search(r'\["LSD",\s*\[\],\s*\{"token":"([^"]+)"', html)
     if m:
         lsd = m.group(1)
+    else:
+        m = re.search(r'"lsd"\s*:\s*"([^"]+)"', html)
+        if m:
+            lsd = m.group(1)
+
+    # Same for __rev: the hardcoded one is stale, and the page carries the
+    # revision it was built with.
+    m = re.search(r'"server_revision":\s*"?(\d+)"?', html)
+    if m:
+        server_revision = m.group(1)
 
     m = re.search(r'"profile_pic_url"\s*:\s*"((?:[^"\\]|\\.)*)"', html)
     if m:
@@ -249,7 +292,7 @@ def _parse_profile_html(html: str) -> tuple[str | None, str | None, str | None]:
         # CDN will not serve.
         pic = m.group(1).replace(r"\u0026", "&").replace(r"\/", "/")
 
-    return user_id, lsd, pic
+    return user_id, lsd, pic, server_revision
 
 
 def _parse_post_node(node: dict, fallback_username: str | None = None) -> Post | None:
@@ -396,6 +439,9 @@ class ThreadsAPI:
         self.impersonate = impersonate
         self.timeout = timeout
         self._client: Any = None
+        # True only for a client this class built. An injected one (tests, a
+        # caller supplying their own session) is never discarded or rebuilt.
+        self._owns_client = False
         self.rate_limit_config = rate_limit_config or RateLimitConfig()
         self._api_limiter = ApiRateLimiter(
             rps=self.rate_limit_config.rps, enabled=self.rate_limit_config.enabled
@@ -405,12 +451,31 @@ class ThreadsAPI:
         # scrape that does both should not pay for two requests.
         self._profile_cache: dict[str, str] = {}
         self._lsd: str | None = None
+        # The revision the profile page was built with. Beats the hardcoded
+        # __rev, which was several million behind by the time this was written.
+        self._server_revision: str | None = None
+        # Replayable GraphQL request parameters, discovered from the web app.
+        # Keyed by username: the captured variables carry the userID of the
+        # account the browser queried, which is only valid for that profile.
+        self._templates: dict[str, RequestTemplate] = {}
+        self._template: RequestTemplate | None = None
+        self._template_attempted = False
+        self._template_attempts = 0
+        self._fingerprint_cache: str | None = None
         # Counters for the most recent get_posts() call, so the CLI can report a
         # truncated scrape instead of ending in silence.
         self.last_report = ScrapeReport()
 
     def _headers(self) -> dict[str, str]:
         csrf = get_csrf_token(self.cookies) or ""
+        # The captured template carries the lsd the request was built with, and
+        # it must agree with the body's lsd: Threads pairs the two. Prefer the
+        # template's; fall back to the one parsed off the profile page.
+        lsd = ""
+        if self._template is not None:
+            lsd = self._template.params.get("lsd", "")
+        if not lsd:
+            lsd = self._lsd or ""
         h = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -422,7 +487,7 @@ class ThreadsAPI:
             "X-IG-App-ID": _X_IG_APP_ID,
             "X-ASBD-ID": _X_ASBD_ID,
             "Referer": "https://www.threads.com/",
-            "X-FB-LSD": self._lsd or "",
+            "X-FB-LSD": lsd,
             "Sec-Fetch-Site": "same-origin",
             "Sec-Fetch-Mode": "cors",
         }
@@ -436,6 +501,7 @@ class ThreadsAPI:
         """
         if self._client:
             return self._client
+        self._owns_client = True
         if self.impersonate:
             # curl_cffi takes (connect, total): the read budget must cover a
             # whole GraphQL response, so scale it off the public `timeout`.
@@ -541,17 +607,115 @@ class ThreadsAPI:
         self._profile_cache[username] = html
         return html
 
+    def _fingerprint(self) -> str:
+        """Cache key for the current session's captured template.
+
+        Computed once: the cookies do not change over a client's life, and this
+        runs on every page of the walk.
+        """
+        if self._fingerprint_cache is None:
+            self._fingerprint_cache = session_fingerprint(self.cookies)
+        return self._fingerprint_cache
+
+    def _ensure_template(self, username: str) -> RequestTemplate | None:
+        """Return a usable request template, discovering one if needed.
+
+        Order: in-memory, then disk cache, then a browser capture.
+
+        ``_template_failures`` bounds the capture attempts. It exists so that
+        "the browser is missing" fails once and fast instead of stalling on
+        every page, while still leaving room for the retry that follows a
+        rejection: the first capture may fail simply because there was no cache,
+        the second because the server refused what we sent, and those are
+        different problems that happen to share a remedy.
+        """
+        key = username.lstrip("@").split("/")[0]
+        cached_in_memory = self._templates.get(key)
+        if cached_in_memory is not None:
+            self._template = cached_in_memory
+            return cached_in_memory
+
+        # The cache is per (session, account): the captured tokens are bound to
+        # the session that produced them, and the captured variables name the
+        # profile the browser visited.
+        fingerprint = self._fingerprint()
+        cached = load_template(fingerprint, key)
+        if cached is not None:
+            self._templates[key] = cached
+            self._template = cached
+            return cached
+
+        if self._template_attempted:
+            return None
+        self._template_attempted = True
+        self._template_attempts += 1
+        if self._template_attempts > _MAX_TEMPLATE_ATTEMPTS:
+            # Two captures, two rejections: something structural changed.
+            # Stop here rather than looping against Threads.
+            _warn(
+                "the GraphQL query was refused again after recapturing its id; "
+                "stopping the fast path for this run"
+            )
+            return None
+
+        try:
+            _require_playwright()
+        except ImportError:
+            # Degrade cleanly: no template, no browser, so the fast path is
+            # impossible for this run. Say exactly how to enable it rather than
+            # failing with a bare ImportError later.
+            _warn(
+                "no cached GraphQL template and the browser extra is missing, so "
+                "the query parameters cannot be discovered. Install "
+                "'threadstractormf[browser]' and 'playwright install chromium' to "
+                "enable the fast API path."
+            )
+            return None
+
+        try:
+            template = discover_and_cache(username, self.cookies)
+        except Exception as exc:
+            _warn(
+                f"could not capture the GraphQL request template "
+                f"({exc.__class__.__name__}); falling back to the DOM scraper"
+            )
+            return None
+
+        self._templates[username.lstrip("@").split("/")[0]] = template
+        self._template = template
+        _warn(f"captured a current GraphQL doc_id ({template.doc_id})")
+        return template
+
+    def _invalidate_template(self) -> None:
+        """Drop the template the server just rejected.
+
+        Both the in-memory copy and the disk cache go, so the next attempt
+        rediscovers rather than replaying a doc_id known to be dead.
+
+        The attempt guard is reset as well: this is the server telling us the
+        id is wrong, which is a *different* situation from having no way to get
+        one, and it deserves its own capture. :attr:`_template_attempts` is
+        what stops that from looping.
+        """
+        username = self._template.username if self._template else ""
+        self._templates.pop(username, None)
+        self._template = None
+        self._template_attempted = False
+        clear_template(self._fingerprint(), username)
+
     def _resolve_user_id(self, username: str) -> str:
         if username in self._user_id_cache:
             return self._user_id_cache[username]
 
         html = self._profile_html(username)
         if html is not None:
-            user_id, lsd, _pic = _parse_profile_html(html)
+            user_id, lsd, _pic, rev = _parse_profile_html(html)
             if user_id:
                 self._user_id_cache[username] = user_id
                 if lsd:
                     self._lsd = lsd
+                if rev:
+                    self._server_revision = rev
                 return user_id
             # No userID: fall through to the DOM scraper rather than burning a
             # GraphQL call on an id we already know is unreliable.
@@ -563,9 +727,11 @@ class ThreadsAPI:
             html = self._profile_html(username)
             user_id = lsd = pic = None
             if html is not None:
-                user_id, lsd, pic = _parse_profile_html(html)
+                user_id, lsd, pic, rev = _parse_profile_html(html)
                 if lsd:
                     self._lsd = lsd
+                if rev:
+                    self._server_revision = rev
                 # Seed the cache so get_posts() can skip its own page fetch.
                 if user_id:
                     self._user_id_cache[username] = user_id
@@ -902,6 +1068,194 @@ class ThreadsAPI:
         # repost filter already implicit: username == target (DOM filtered)
         return posts
 
+    def _walk_graphql(
+        self,
+        username: str,
+        user_id: str,
+        *,
+        limit: int | None,
+        exclude_reposts: bool,
+        report: ScrapeReport,
+        collected: list[Post],
+    ) -> list[Post]:
+        """Walk the profile cursor, appending into ``collected``.
+
+        ``collected`` is passed in rather than returned so that posts parsed
+        before a mid-walk failure survive the exception: a crawl that dies on
+        page 7 still has six pages of good output, and dropping them would
+        throw away work that was already paid for.
+
+        Split out of :meth:`get_posts` so the stale-template retry can re-enter
+        it from scratch with a freshly captured template, instead of resuming a
+        walk whose cursor belongs to parameters that no longer resolve.
+        """
+        # GraphQL path: walk the `after` cursor until the profile is
+        # exhausted or `limit` is met. A single request only ever
+        # returns _PAGE_SIZE posts, so without this loop `--limit 50`
+        # silently truncated to one page.
+        # ``userID`` comes from the captured template, not from the profile HTML.
+        # The HTML carries several ``userID`` fields and the first one is the
+        # *viewer's own* account, not the profile being read — using it made
+        # every GraphQL query ask for the wrong account, which Threads refuses
+        # with ``execution error``. The template's variables name the account
+        # the browser actually queried, which is by construction the right one.
+        template = self._ensure_template(username)
+        target_id = (template.variables.get("userID") or template.user_id) if template else ""
+        if not target_id:
+            target_id = user_id
+        if not target_id:
+            raise _NonJsonResponse("could not determine the target account id")
+
+        variables = {
+            "after": None,
+            "allow_page_info_for_lox_user": False,
+            "before": None,
+            "first": _PAGE_SIZE,
+            "last": None,
+            "userID": target_id,
+            "__relay_internal__pv__BarcelonaIsLoggedInrelayprovider": False,
+        }
+        out: list[Post] = []
+        seen_ids: set[str] = set()
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        # With a limit, never fetch more pages than could be needed.
+        # Reposts get filtered and posts are deduped, so a page can
+        # yield fewer than _PAGE_SIZE usable posts: leave headroom.
+        # _MAX_PAGES stays a hard ceiling so an absurd --limit cannot
+        # turn into an unbounded walk.
+        page_budget = _MAX_PAGES
+        if limit is not None:
+            page_budget = min(_MAX_PAGES, max(1, -(-limit // _PAGE_SIZE) + 2))
+        for _ in range(page_budget):
+            variables["after"] = cursor
+            if template is None:
+                # No template and no way to get one: the walk cannot
+                # start. Degrade to the DOM scraper with an actionable
+                # message instead of sending a request known to fail.
+                # Only claim this as the api_error when nothing better is
+                # already known — a prior page may have failed for a real
+                # reason worth reporting.
+                if not report.api_error:
+                    report.api_error = (
+                        "no GraphQL request template available and discovery "
+                        "is unavailable; install the browser extra to enable "
+                        "automatic recovery"
+                    )
+                raise _NonJsonResponse(report.api_error)
+            # The client bakes headers in at construction, and the X-FB-LSD it
+            # carries comes from the template — which is discovered *after* the
+            # first request already built the client (the profile fetch runs
+            # first). Patching the header dict in place was tried and only
+            # worked for httpx: CurlClient, used by --impersonate, exposes no
+            # ``headers`` at all, so it raised AttributeError on the
+            # documented WAF-circumvention path.
+            #
+            # Only a client this class built is replaced. An injected one (a
+            # MockTransport in tests, a caller supplying their own session) must
+            # be left alone: discarding it would silently swap a mocked
+            # transport for a real one and send the request to the network.
+            if self._client is not None and self._owns_client:
+                self._client.close()
+                self._client = None
+            body = build_body(template, variables)
+            resp = self._request_with_rate_limit("POST", template.endpoint, data=body)
+            report.pages_fetched += 1
+            # Threads answers 200 text/html (the web app shell) when the
+            # query is rejected — stale doc_id, a rotated __rev, a
+            # missing LSD. That used to raise inside resp.json(), get
+            # swallowed by the broad except below and surface only as
+            # "falling back to the DOM scraper", hiding the real cause.
+            # Decode defensively rather than trusting the content-type:
+            # a real GraphQL reply may omit the header, and what matters
+            # is whether the body parses as JSON at all.
+            try:
+                j = resp.json()
+            except ValueError as exc:
+                ctype = (resp.headers.get("content-type") or "no content-type")
+                report.api_error = (
+                    f"GraphQL returned {resp.status_code} {ctype.split(';')[0]} "
+                    f"instead of JSON ({exc.__class__.__name__}); "
+                    "stale doc_id or __rev"
+                )
+                raise _NonJsonResponse(report.api_error) from exc
+            if not (j.get("data") and j["data"].get("mediaData")):
+                # Distinguish "the server refused the query" from "the
+                # payload was merely partial". Threads answers a stale
+                # doc_id / rotated __rev with 200 JSON carrying
+                # errors: [{"severity": "CRITICAL", ...}] and no data —
+                # indistinguishable from an empty profile unless the
+                # errors field is inspected, which it never was.
+                errors = j.get("errors") or []
+                if errors:
+                    msgs = "; ".join(
+                        str(e.get("message", e))[:60]
+                        for e in errors[:2]
+                        if isinstance(e, dict)
+                    ) or "no detail"
+                    report.api_error = f"GraphQL returned errors: {msgs}"
+                    report.stop_reason = "the API rejected the query"
+                    # The cached template just proved it no longer
+                    # resolves. Throw it away and capture a fresh one
+                    # from the web app, then let the walk be retried by
+                    # the caller rather than dying on a stale id.
+                    self._invalidate_template()
+                    raise _StaleTemplate(report.api_error)
+                else:
+                    report.stop_reason = "mediaData absent"
+                break  # partial/absent payload: keep what we have
+
+            media_data = j["data"]["mediaData"]
+            for edge in media_data.get("edges", []) or []:
+                node = edge.get("node") or {}
+                post = _parse_post_node(node, fallback_username=username)
+                if not post:
+                    report.unparsed += 1
+                    continue
+                if exclude_reposts and post.username.lower() != username.lower():
+                    report.reposts_skipped += 1
+                    continue
+                # Guard against a cursor that loops back over edges we
+                # already emitted.
+                if post.id in seen_ids:
+                    continue
+                seen_ids.add(post.id)
+                out.append(post)
+                # Mirror into `collected` immediately: if the next request
+                # raises, this post is still real output and must not be lost.
+                collected.append(post)
+                if limit is not None and len(out) >= limit:
+                    break
+
+            if limit is not None and len(out) >= limit:
+                report.stop_reason = f"limit reached ({limit})"
+                break
+
+            # page_info parsing is defensive: a missing/renamed key
+            # must not turn into an infinite walk.
+            page_info = media_data.get("page_info") or {}
+            if not isinstance(page_info, dict) or not page_info.get("has_next_page"):
+                report.stop_reason = "the server reports no further pages"
+                break
+            next_cursor = page_info.get("end_cursor")
+            if not next_cursor or not isinstance(next_cursor, str):
+                report.stop_reason = "page_info carries no usable end_cursor"
+                break
+            if next_cursor in seen_cursors:
+                report.stop_reason = "the server repeated the cursor"
+                break  # server repeating the cursor -> stop
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        else:
+            report.truncated = True
+            report.stop_reason = f"page budget of {page_budget} exhausted"
+
+        if out:
+            if limit is not None:
+                out = out[:limit]
+            return out
+        return []
+
     def get_posts(
         self, username: str, *, limit: int | None = None, exclude_reposts: bool = True
     ) -> list[Post]:
@@ -920,141 +1274,58 @@ class ThreadsAPI:
                 user_id = None
                 report.api_error = f"userID: {exc.__class__.__name__}"
             if user_id:
-                # GraphQL path: walk the `after` cursor until the profile is
-                # exhausted or `limit` is met. A single request only ever
-                # returns _PAGE_SIZE posts, so without this loop `--limit 50`
-                # silently truncated to one page.
-                variables = {
-                    "after": None,
-                    "allow_page_info_for_lox_user": False,
-                    "before": None,
-                    "first": _PAGE_SIZE,
-                    "last": None,
-                    "userID": user_id,
-                    "__relay_internal__pv__BarcelonaIsLoggedInrelayprovider": False,
-                }
-                out: list[Post] = []
-                seen_ids: set[str] = set()
-                cursor: str | None = None
-                seen_cursors: set[str] = set()
-                # With a limit, never fetch more pages than could be needed.
-                # Reposts get filtered and posts are deduped, so a page can
-                # yield fewer than _PAGE_SIZE usable posts: leave headroom.
-                # _MAX_PAGES stays a hard ceiling so an absurd --limit cannot
-                # turn into an unbounded walk.
-                page_budget = _MAX_PAGES
-                if limit is not None:
-                    page_budget = min(
-                        _MAX_PAGES, max(1, -(-limit // _PAGE_SIZE) + 2)
+                try:
+                    out = self._walk_graphql(
+                        username,
+                        user_id,
+                        limit=limit,
+                        exclude_reposts=exclude_reposts,
+                        report=report,
+                        collected=collected,
                     )
-                for _ in range(page_budget):
-                    variables["after"] = cursor
-                    body = {
-                        "av": "0",
-                        "__user": "0",
-                        "__a": "1",
-                        "__req": "1",
-                        "dpr": "1",
-                        "__ccg": "EXCELLENT",
-                        "__rev": "1045963118",
-                        "lsd": self._lsd or "",
-                        "jazoest": "22171",
-                        "fb_api_caller_class": "RelayModern",
-                        "fb_api_req_friendly_name": (
-                            "BarcelonaProfileMediaTabRefetchableDirectQuery"
-                        ),
-                        "variables": json.dumps(variables),
-                        "server_timestamps": "true",
-                        "doc_id": _DOC_ID_MEDIA,
-                    }
-                    resp = self._request_with_rate_limit("POST", _GRAPHQL_URL, data=body)
-                    report.pages_fetched += 1
-                    # Threads answers 200 text/html (the web app shell) when the
-                    # query is rejected — stale doc_id, a rotated __rev, a
-                    # missing LSD. That used to raise inside resp.json(), get
-                    # swallowed by the broad except below and surface only as
-                    # "falling back to the DOM scraper", hiding the real cause.
-                    # Decode defensively rather than trusting the content-type:
-                    # a real GraphQL reply may omit the header, and what matters
-                    # is whether the body parses as JSON at all.
+                except _StaleTemplate:
+                    # The cached doc_id was refused. This is the whole reason
+                    # the template is captured rather than hardcoded: capture a
+                    # fresh one and walk again. Bounded by
+                    # _MAX_TEMPLATE_ATTEMPTS — a template that fails twice is
+                    # not going to fix itself.
+                    _warn(
+                        "the cached GraphQL query id is no longer accepted; "
+                        "capturing the current one and retrying"
+                    )
+                    # Nothing was collected under the dead id, and the new walk
+                    # starts from the first page, so the old list is dropped
+                    # rather than merged: the ids may not even mean the same
+                    # thing under a different query revision.
+                    collected.clear()
                     try:
-                        j = resp.json()
-                    except ValueError as exc:
-                        ctype = (resp.headers.get("content-type") or "no content-type")
-                        report.api_error = (
-                            f"GraphQL returned {resp.status_code} {ctype.split(';')[0]} "
-                            f"instead of JSON ({exc.__class__.__name__}); "
-                            "stale doc_id or __rev"
+                        out = self._walk_graphql(
+                            username,
+                            user_id,
+                            limit=limit,
+                            exclude_reposts=exclude_reposts,
+                            report=report,
+                            collected=collected,
                         )
-                        raise _NonJsonResponse(report.api_error) from exc
-                    if not (j.get("data") and j["data"].get("mediaData")):
-                        # Distinguish "the server refused the query" from "the
-                        # payload was merely partial". Threads answers a stale
-                        # doc_id / rotated __rev with 200 JSON carrying
-                        # errors: [{"severity": "CRITICAL", ...}] and no data —
-                        # indistinguishable from an empty profile unless the
-                        # errors field is inspected, which it never was.
-                        errors = j.get("errors") or []
-                        if errors:
-                            msgs = "; ".join(
-                                str(e.get("message", e))[:60]
-                                for e in errors[:2]
-                                if isinstance(e, dict)
-                            ) or "no detail"
-                            report.api_error = f"GraphQL returned errors: {msgs}"
-                            report.stop_reason = "the API rejected the query"
-                        else:
-                            report.stop_reason = "mediaData absent"
-                        break  # partial/absent payload: keep what we have
-
-                    media_data = j["data"]["mediaData"]
-                    for edge in media_data.get("edges", []) or []:
-                        node = edge.get("node") or {}
-                        post = _parse_post_node(node, fallback_username=username)
-                        if not post:
-                            report.unparsed += 1
-                            continue
-                        if exclude_reposts and post.username.lower() != username.lower():
-                            report.reposts_skipped += 1
-                            continue
-                        # Guard against a cursor that loops back over edges we
-                        # already emitted.
-                        if post.id in seen_ids:
-                            continue
-                        seen_ids.add(post.id)
-                        out.append(post)
-                        if limit is not None and len(out) >= limit:
-                            break
-
-                    if limit is not None and len(out) >= limit:
-                        report.stop_reason = f"limit reached ({limit})"
-                        break
-
-                    # Everything parsed so far survives a failure further down.
-                    collected = out
-
-                    # page_info parsing is defensive: a missing/renamed key
-                    # must not turn into an infinite walk.
-                    page_info = media_data.get("page_info") or {}
-                    if not isinstance(page_info, dict) or not page_info.get("has_next_page"):
-                        report.stop_reason = "the server reports no further pages"
-                        break
-                    next_cursor = page_info.get("end_cursor")
-                    if not next_cursor or not isinstance(next_cursor, str):
-                        report.stop_reason = "page_info carries no usable end_cursor"
-                        break
-                    if next_cursor in seen_cursors:
-                        report.stop_reason = "the server repeated the cursor"
-                        break  # server repeating the cursor -> stop
-                    seen_cursors.add(next_cursor)
-                    cursor = next_cursor
-                else:
-                    report.truncated = True
-                    report.stop_reason = f"page budget of {page_budget} exhausted"
+                        report.api_error = ""
+                    except Exception as exc:
+                        # Keep the *original* rejection as the reported cause:
+                        # "we could not rediscover a working id" is a detail of
+                        # the recovery, while "the server refused the query" is
+                        # what the user needs to read.
+                        detail = exc.__class__.__name__
+                        _warn(
+                            f"the GraphQL query is still rejected after recapture "
+                            f"({detail}); falling back"
+                        )
+                        out = []
+                        if not report.api_error:
+                            report.api_error = (
+                                "GraphQL query rejected and no replacement "
+                                "doc_id could be captured"
+                            )
 
                 if out:
-                    if limit is not None:
-                        out = out[:limit]
                     _finish_report(report, out)
                     return out
         except Exception as exc:

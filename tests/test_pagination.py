@@ -9,6 +9,7 @@ partial result was non-empty the Playwright fallback never kicked in either.
 import json
 
 import httpx
+from conftest import seed_template
 
 import threadstractormf.rate_limit as rl
 from threadstractormf.api import _MAX_PAGES, _PAGE_SIZE, ThreadsAPI
@@ -71,6 +72,9 @@ def _scrape(pages, limit):
     # test modules stub this the same way.
     api._fetch_posts_via_playwright = lambda _u, _l: []
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
+    # Same reason: the doc_id is discovered and cached rather than hardcoded,
+    # so without a seeded template this goes looking for a real browser.
+    seed_template(api)
     return api.get_posts("user", limit=limit), calls
 
 

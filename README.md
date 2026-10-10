@@ -223,7 +223,7 @@ threadstractormf --cookies-from-browser brave @user
 
 Port of `threads-downloader/background.js` + `gallery-dl sleep`:
 - **Downloads CDNs** `scontent.cdninstagram.com`: `cooldown 2s` + `120s each 100` + `jitter 20%` ( → `3-5s` with `4000ms` + `jitter 0.25`), single worker
-- **GraphQL** `https://www.threads.com/graphql/query` (`doc_id 37598244946487292`): token bucket `0.5 rps` + `429 Retry-After` + exponential backoff `base 2.0` (like `gallery-dl --sleep 3-6 --sleep-request 8-15 --sleep-429 120`)
+- **GraphQL** `https://www.threads.com/graphql/query`: token bucket `0.5 rps` + `429 Retry-After` + exponential backoff `base 2.0` (like `gallery-dl --sleep 3-6 --sleep-request 8-15 --sleep-429 120`). The request's parameters — `doc_id` above all — are **captured from the live web app and cached**, not hardcoded; see below.
 
 Meta WAF checks JA3/JA4 TLS + HTTP/2 SETTINGS + `X-CSRFToken`/`X-ASBD-ID`/`X-IG-App-ID`. If `403` with `httpx`, install `curl_cffi` and use `--impersonate chrome` (byte-for-byte Chrome, same mechanism as `yt-dlp --impersonate`). Accepted targets: `chrome`, `chrome131`, `firefox`, `safari`, `edge`, `tor` and other pinned fingerprints; an unknown name fails immediately with the list of valid ones.
 
@@ -231,17 +231,39 @@ Impersonation covers **both** the GraphQL calls and the CDN downloads — a WAF 
 
 Retries only ever happen for genuinely transient failures: `429`, `5xx`, DNS/timeout/TLS resets. A permanent `403`/`404` is reported immediately instead of sitting through ~60s of backoff first.
 
-### Known limitation: the GraphQL query is rejected
+### The GraphQL query id is discovered, not hardcoded
 
-`doc_id 37598244946487292` currently answers `200 OK` with
-`errors: [{"message": "execution error", "severity": "CRITICAL"}]` and no data.
-Meta rotates these ids, so the hardcoded one goes stale. When that happens the
-query is **not** used and the scrape falls back to the browser path below; the
-warning on stderr says so explicitly.
+The profile-media query is a **persisted query**: the client sends no query
+text, only `fb_api_req_friendly_name` plus the `doc_id` that indexes the
+server-side copy. When Meta edits the query it registers a **new** `doc_id` and
+the old one stops resolving — the endpoint answers
 
-The query the web app itself issues (a different `doc_id`, same
-`fb_api_req_friendly_name`) still answers correctly, so recovering this path
-means picking up the current id.
+    {"errors": [{"message": "execution error", "severity": "CRITICAL"}]}
+
+which says nothing about what went wrong. A hardcoded constant cannot survive
+that: until 1.3.0 this project shipped `doc_id 37598244946487292`, it went
+stale, and **every** scrape silently fell through to the slow, truncating DOM
+fallback.
+
+The id is a server-side index, so it cannot be derived or guessed. The only
+source of truth is the request the web app itself issues, so on the first scrape
+that needs one the request is captured, replayed, and cached under
+`~/.cache/threadstractormf/` — keyed by session *and* account, because the
+captured tokens and the captured `variables.userID` belong to one of them. Every
+later scrape is plain GraphQL again (measured on `@zuck`: **19.3s cold → 6.7s
+warm**).
+
+When the cached id is refused, it is thrown away and recaptured, once per scrape.
+That makes a rotation self-healing: no release, no edit, no downtime. If it
+still fails, or if the browser extra is missing, the run degrades to the DOM path
+with an actionable warning on stderr.
+
+Two details measured against the live endpoint, both of which made every replay
+fail while this was being written: the captured `variables` carry ~38
+`__relay_internal__pv__Barcelona*` feature flags that Threads validates and
+refuses the query without, and the `userID` must come from the capture rather
+than from the profile HTML — the first `userID` in that document is the
+*viewer's own* account, not the profile being read.
 
 ### Fallback: the browser path, and why it runs anonymously
 
@@ -302,11 +324,12 @@ Archive is deferred — `threads` currently dedups by filename (deterministic `{
 ```
 threadstractormf/
   _backend.py     # httpx | curl_cffi backend, shared retry policy, pw cookies
+  _discovery.py   # captures + caches the GraphQL request template (doc_id, lsd, variables)
   auth.py         # MozillaCookieJar + load_from_browser("brave")
   models.py       # Post/Media/Profile (pydantic)
   template.py     # {date:%Y-%m-%d}_{post_id}_{num:02d} renderer
   rate_limit.py   # BatchCooldownLimiter + ApiRateLimiter + backoff
-api.py          # GraphQL doc_id 37598244946487292 (paginated) + Playwright DOM fallback
+  api.py          # GraphQL cursor walk (discovered template) + Playwright DOM fallback
     archive.py      # DownloadLedger: .archive/dedup.jsonl + legacy migration
     downloader.py   # is_valid_media_url + download with rate-limit + template
     client.py       # Threadscraper facade
@@ -317,7 +340,13 @@ api.py          # GraphQL doc_id 37598244946487292 (paginated) + Playwright DOM 
 ## Testing
 
 ```bash
-pytest -q  # 212 tests: auth, models, rate limiting (fixed + adaptive), retry policy
+pytest -q  # auth, models, rate limiting (fixed + adaptive), retry policy,
+           # cookie loading, discovery/replay, directory safety
+```
+
+The suite is hermetic: `conftest.py` stubs out `time.sleep` and the network, so
+it finishes in seconds and never depends on Threads being up. Tests that measure
+real pacing (`test_rate_limit.py`) opt back in.
            # across both backends, GraphQL pagination, --impersonate, download
            # ledger and adoption, extension/quality extraction, user-id
            # resolution, subfolder layout, error messages

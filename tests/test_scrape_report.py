@@ -15,6 +15,7 @@ Two halves are covered here:
 import json
 
 import httpx
+from conftest import seed_template
 
 import threadstractormf.rate_limit as rl
 from threadstractormf.api import ThreadsAPI
@@ -55,6 +56,18 @@ def _codes(n, prefix="P"):
     return [f"{prefix}{i}" for i in range(n)]
 
 
+def _seed_template(api):
+    """Give a mocked API a usable request template.
+
+    Since 1.3 the doc_id is captured from the live web app rather than
+    hardcoded, so a mocked transport has to supply one. Without this the walk
+    would reach for Playwright, which is both slow and pointless against a
+    MockTransport. Delegated to the shared helper in conftest so the shape
+    (username key, relay variables) cannot drift from the rest of the suite.
+    """
+    return seed_template(api)
+
+
 def _api(pages, *, user_id="999"):
     """A ThreadsAPI wired to a mocked GraphQL transport."""
     calls = {"n": 0}
@@ -72,6 +85,13 @@ def _api(pages, *, user_id="999"):
     api = ThreadsAPI({"csrftoken": "x"}, rate_limit_config=rl.RateLimitConfig(enabled=False))
     api._resolve_user_id = lambda _u: user_id
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
+    _seed_template(api)
+    # Stub the DOM fallback here rather than per test. These cases all end in
+    # "GraphQL produced nothing", which is exactly when get_posts reaches for
+    # the browser — unstubbed that launches Chromium and calls threads.com for
+    # ~23s, to return posts the test never looks at. Tests that care about the
+    # fallback still override this.
+    api._fetch_posts_via_playwright = lambda _u, _l: []
     api._test_calls = calls  # type: ignore[attr-defined]
     return api
 
@@ -94,6 +114,7 @@ def test_html_instead_of_json_is_reported_not_hidden():
     api = ThreadsAPI({"csrftoken": "x"}, rate_limit_config=rl.RateLimitConfig(enabled=False))
     api._resolve_user_id = lambda _u: "999"
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
+    _seed_template(api)
     api._fetch_posts_via_playwright = lambda _u, _l: []
 
     api.get_posts("user", limit=5)
@@ -113,6 +134,7 @@ def test_the_warning_reaches_stderr_not_stdout(capsys):
     api = ThreadsAPI({"csrftoken": "x"}, rate_limit_config=rl.RateLimitConfig(enabled=False))
     api._resolve_user_id = lambda _u: "999"
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
+    _seed_template(api)
     api._fetch_posts_via_playwright = lambda _u, _l: []
 
     api.get_posts("user", limit=5)

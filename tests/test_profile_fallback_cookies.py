@@ -16,7 +16,13 @@ import http.cookiejar
 
 import pytest
 
-from threadstractormf.api import _PROFILE_FALLBACK_AUTHENTICATED, ThreadsAPI
+from threadstractormf.api import (
+    _CEILING_REASON,
+    _LIMIT_REASON,
+    _PROFILE_FALLBACK_AUTHENTICATED,
+    _STOP_RENDERING_REASON,
+    ThreadsAPI,
+)
 
 
 def _jar() -> http.cookiejar.CookieJar:
@@ -52,8 +58,11 @@ def _jar() -> http.cookiejar.CookieJar:
 class _FakePage:
     """Records what the fallback injected and how hard it scrolled."""
 
-    def __init__(self, posts: int) -> None:
+    def __init__(self, posts: int, growing: bool = False) -> None:
         self.posts = posts
+        # A page that keeps rendering never trips the empty-rounds break, so the
+        # walk runs its full course and hits the scroll ceiling instead.
+        self.growing = growing
         self.added: list[list[dict[str, str]]] = []
         self.wheel_calls = 0
 
@@ -81,6 +90,8 @@ class _FakePage:
         if script.rstrip().endswith(".length"):
             # The walk counts rendered <time> elements to decide whether the
             # profile grew; a stable count models a page that is done loading.
+            if self.growing:
+                self.posts += 1
             return self.posts
         # The big extractor script returns a list of post dicts.
         return [
@@ -222,10 +233,69 @@ def test_a_slow_first_batch_is_still_scrolled_through(monkeypatch):
 
 
 @pytest.mark.parametrize("authenticated", [True, False])
-def test_the_flag_does_not_change_the_return_type(monkeypatch, authenticated):
-    """Both branches hand back a list; the caller cannot tell them apart."""
+def test_the_flag_does_not_change_what_is_returned(monkeypatch, authenticated):
+    """Both branches read the same posts; only the cookies differ.
+
+    Renamed from ``..._return_type``: the return is now a DomScrape rather than
+    a bare list, so that name states something false. The posts inside are
+    unchanged, which is what this test is actually about — the
+    ``authenticated`` flag must not affect coverage, only which account's view
+    of it is read.
+    """
     page = _FakePage(4)
     _install(page, monkeypatch)
     api = ThreadsAPI(_jar())
     out = api._fetch_posts_via_playwright("u", 10, authenticated=authenticated)
-    assert isinstance(out, list)
+    assert [p.id for p in out.posts] == [f"P{i}" for i in range(4)]
+
+
+# --- why the walk stopped ---------------------------------------------------
+#
+# The three exits below used to be indistinguishable: the caller got the same
+# list either way, and the report kept whatever reason the failed API attempt
+# had left behind. So a browser scrape that ran out of scrolls was summarised
+# with "the API rejected the query", naming a walk that had already handed over.
+
+
+def test_a_page_that_keeps_rendering_reports_the_scroll_ceiling(monkeypatch):
+    """Never breaking out is the one exit that *proves* truncation."""
+    page = _FakePage(2, growing=True)
+    _install(page, monkeypatch)
+    api = ThreadsAPI(_jar())
+
+    out = api._fetch_posts_via_playwright("u", None)
+
+    assert out.reason == _CEILING_REASON
+    assert out.exhausted is False, "the ceiling is not completion"
+
+
+def test_a_page_that_stops_rendering_is_reported_as_such(monkeypatch):
+    """The end of the timeline, as far as the walk can tell.
+
+    ``exhausted`` stays False here on purpose: "stopped rendering" is a
+    heuristic, and it is the one that once returned 4 posts out of 9 in silence.
+    The reason is recorded so the summary can say it, without claiming the
+    profile was fully read.
+    """
+    page = _FakePage(4)  # a stable count: nothing new renders
+    _install(page, monkeypatch)
+    api = ThreadsAPI(_jar())
+
+    out = api._fetch_posts_via_playwright("u", None)
+
+    assert out.reason == _STOP_RENDERING_REASON
+    assert out.exhausted is False, "not proof of a complete profile"
+    assert len(out.posts) == 4
+
+
+def test_hitting_the_limit_is_reported_as_the_limit(monkeypatch):
+    page = _FakePage(4)
+    _install(page, monkeypatch)
+    api = ThreadsAPI(_jar())
+
+    out = api._fetch_posts_via_playwright("u", 2)
+
+    assert out.reason == _LIMIT_REASON
+    assert len(out.posts) == 2, "the limit is applied to the posts"
+    # Asking for less is not truncation, whatever the heuristic says.
+    assert out.exhausted is True

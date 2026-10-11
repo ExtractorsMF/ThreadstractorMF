@@ -391,3 +391,75 @@ def test_a_genuinely_empty_payload_is_not_reported_as_an_error():
     report = api.last_report
     assert report.api_error == ""
     assert report.stop_reason == "mediaData absent"
+
+
+# --- the fallback's summary must not contradict itself ----------------------
+#
+# A browser scrape used to print two warnings that disagreed: "it reads the
+# public profile in full" and, immediately after, "the walk stopped before
+# exhausting the profile (the API rejected the query)". Both were true of the
+# two different stages, and neither of the stage that actually produced the
+# posts.
+
+
+def _summary(report, capsys):
+    from threadstractormf.cli import _report_scrape
+
+    _report_scrape(report)
+    return capsys.readouterr().err
+
+
+def test_the_fallback_does_not_also_claim_the_walk_was_cut_short(capsys):
+    from threadstractormf.api import ScrapeReport
+
+    report = ScrapeReport(posts=9, media=54, truncated=True, used_fallback=True)
+    report.fallback_reason = "the profile stopped rendering new posts"
+    err = _summary(report, capsys)
+
+    assert "the walk stopped before exhausting" not in err, err
+    # But truncation is not hidden: it is folded into the fallback message.
+    assert "stopped because the profile stopped rendering" in err
+
+
+def test_a_truncated_api_walk_still_warns_on_its_own(capsys):
+    """The guard must not swallow the warning when no fallback was involved."""
+    from threadstractormf.api import ScrapeReport
+
+    report = ScrapeReport(posts=4, media=29, truncated=True, stop_reason="page budget")
+    err = _summary(report, capsys)
+
+    assert "the walk stopped before exhausting" in err
+    assert "page budget" in err
+
+
+def test_the_fallback_message_names_its_own_reason_not_the_apis(capsys):
+    from threadstractormf.api import ScrapeReport
+
+    report = ScrapeReport(
+        posts=9,
+        media=54,
+        truncated=True,
+        used_fallback=True,
+        api_error="GraphQL returned errors: execution error",
+        stop_reason="the API rejected the query",
+    )
+    report.fallback_reason = "the scroll ceiling was reached"
+    err = _summary(report, capsys)
+
+    # The API error survives: it is still why we left the fast path.
+    assert "the API did not respond" in err
+    assert "execution error" in err
+    # But it is not quoted as the reason the walk stopped.
+    assert "the walk stopped before exhausting" not in err
+    assert "It stopped because the scroll ceiling was reached" in err
+    assert "(the API rejected the query)" not in err
+
+
+def test_coerce_dom_accepts_the_plain_lists_tests_stub_with():
+    """Thirty-odd tests stub the fallback with a bare list; they must keep working."""
+    from threadstractormf.api import DomScrape, coerce_dom
+
+    assert coerce_dom([]).posts == []
+    assert coerce_dom(["DOM"]).posts == ["DOM"]
+    real = DomScrape(posts=[1], exhausted=True, reason="r")
+    assert coerce_dom(real) is real

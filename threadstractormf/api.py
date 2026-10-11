@@ -20,7 +20,7 @@ import random
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -73,6 +73,13 @@ _MAX_PAGES = 200
 # the problem is not a rotated id, and retrying only hammers the endpoint.
 _MAX_TEMPLATE_ATTEMPTS = 2
 
+# How the browser fallback's scroll walk ended. The ceiling is the only exit
+# that means truncation outright; the others leave it genuinely unclear, and the
+# summary should not claim otherwise.
+_CEILING_REASON = "the scroll ceiling was reached"
+_STOP_RENDERING_REASON = "the profile stopped rendering new posts"
+_LIMIT_REASON = "the requested limit was reached"
+
 
 def _warn(message: str) -> None:
     """Diagnostic on stderr.
@@ -103,6 +110,12 @@ class ScrapeReport:
     truncated: bool = False
     stop_reason: str = ""
     used_fallback: bool = False
+    # Why the *browser* scraper stopped, when it is the one that produced the
+    # output. Kept apart from stop_reason because the two describe different
+    # walks: stop_reason belonged to the GraphQL attempt that already handed
+    # over, and leaving it there made the summary blame the API for a walk the
+    # browser scraper ended.
+    fallback_reason: str = ""
     api_error: str = ""
     limit: int | None = None
     # Filled in by the CLI as the media loop runs: download_media reports
@@ -110,6 +123,34 @@ class ScrapeReport:
     downloaded: int = 0
     skipped: int = 0
     failed: int = 0
+
+
+@dataclass
+class DomScrape:
+    """What the browser scraper produced, and why it stopped.
+
+    The fallback used to hand back a bare list, so "reached the end of the
+    timeline" and "ran out of scrolls" were indistinguishable to the caller —
+    and the report carried whatever reason the failed API attempt had left
+    behind.
+    """
+
+    posts: list[Any] = field(default_factory=list)
+    # Proven only by the scroll loop ending on a break. False means the ceiling
+    # was hit, which is truncation rather than completion.
+    exhausted: bool = False
+    reason: str = ""
+
+
+def coerce_dom(value: Any) -> DomScrape:
+    """Accept either a DomScrape or the plain lists the test stubs return.
+
+    Thirty-odd tests stub the fallback with ``[]`` or ``["DOM"]``; without this
+    every one of them would break on an unrelated change.
+    """
+    if isinstance(value, DomScrape):
+        return value
+    return DomScrape(posts=list(value) if value else [])
 
 
 class _NonJsonResponse(Exception):
@@ -844,7 +885,13 @@ class ThreadsAPI:
         limit: int | None,
         *,
         authenticated: bool = _PROFILE_FALLBACK_AUTHENTICATED,
-    ) -> list[Post]:
+    ) -> DomScrape:
+        """Read the profile with a browser.
+
+        Returns a :class:`DomScrape` rather than a bare list so the caller can
+        tell "the timeline ended" from "we hit the scroll ceiling" — the two
+        look identical in the posts and mean the opposite thing about coverage.
+        """
         from collections import defaultdict
 
         _require_playwright()
@@ -905,6 +952,13 @@ class ThreadsAPI:
             empty_rounds = 0
             prev_time_count = 0
             data: list[dict[str, Any]] = []
+            # Why the walk ended. The three exits below used to be
+            # indistinguishable: "the profile ran out", "the caller wanted less"
+            # and "we hit the ceiling" all left the caller with the same list
+            # and no explanation, so the summary ended up quoting the reason the
+            # *API* attempt had failed. The scroll ceiling is the one that
+            # actually means truncation, and it is the for/else below.
+            reason = ""
             for scroll in range(max_scrolls):
                 page.mouse.wheel(0, 4000)
                 # Per-scroll pacing is what decides whether the profile is read
@@ -930,6 +984,11 @@ class ThreadsAPI:
                 if time_count == prev_time_count:
                     empty_rounds += 1
                     if empty_rounds >= empty_rounds_limit:
+                        # The walk believes it reached the end of the timeline.
+                        # "Believes" is doing real work here: this is a heuristic
+                        # on rendering, and it is the one that once truncated 9
+                        # posts to 4 in silence.
+                        reason = _STOP_RENDERING_REASON
                         break
                     # skip the heavy extraction when nothing new rendered
                     continue
@@ -1065,9 +1124,15 @@ class ThreadsAPI:
                     if limit is not None and len(posts) >= limit:
                         break
                 if limit is not None and len(posts) >= limit:
+                    reason = _LIMIT_REASON
                     break
                 # NOTE: no early break on empty rounds here — the scroll loop
                 # already stops after 3 consecutive rounds without new renders
+            else:
+                # The loop ran its full course without a break: the ceiling is
+                # the one exit that means the timeline was cut short rather
+                # than finished.
+                reason = _CEILING_REASON
             b.close()
         # merge XHR-captured videos into converted posts (late posts only exist
         # here — their media JSON is never serialized into document HTML)
@@ -1099,7 +1164,12 @@ class ThreadsAPI:
         if limit is not None:
             posts = posts[:limit]
         # repost filter already implicit: username == target (DOM filtered)
-        return posts
+        # `exhausted` means "we know this is everything the caller asked for",
+        # not "we read the whole profile". Only the requested limit earns that:
+        # stopping because the page stopped rendering is a heuristic, and it is
+        # the one that once returned 4 posts out of 9 in silence. The ceiling is
+        # the opposite — known truncation.
+        return DomScrape(posts=posts, exhausted=reason == _LIMIT_REASON, reason=reason)
 
     def _walk_graphql(
         self,
@@ -1378,8 +1448,17 @@ class ThreadsAPI:
             )
         # Fallback DOM robusto
         report.used_fallback = True
-        report.truncated = True  # the DOM fallback only ever sees a viewport
-        posts = self._fetch_posts_via_playwright(username, limit)
+        # Still pessimistic on purpose. The scroll walk can only say it stopped
+        # *rendering*, which is not proof the timeline ended — that heuristic
+        # once returned 4 posts out of 9 in silence. So truncated stays True and
+        # what changes is the reason: it now names the walk that produced the
+        # output instead of the API attempt that already handed over.
+        report.truncated = True
+        dom = coerce_dom(self._fetch_posts_via_playwright(username, limit))
+        posts = dom.posts
+        report.fallback_reason = dom.reason
+        if dom.reason:
+            report.stop_reason = dom.reason
         if not posts:
             # Not an exception: an empty or private profile legitimately yields
             # nothing, and that cannot be told apart from a silent failure.

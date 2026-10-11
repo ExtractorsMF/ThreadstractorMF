@@ -73,12 +73,19 @@ def _report_scrape(report: ScrapeReport) -> None:
             soft_wrap=True,
         )
     if report.used_fallback:
-        err_console.print(
+        msg = (
             "warning — the browser fallback was used: it is slower than the "
-            "API, but it reads the public profile in full.",
-            soft_wrap=True,
+            "API, but it reads the public profile in full."
         )
-    if report.truncated:
+        if report.fallback_reason:
+            msg += f" It stopped because {report.fallback_reason}."
+        err_console.print(msg, soft_wrap=True)
+    elif report.truncated:
+        # Only when the API walk is the one that delivered the posts. With the
+        # fallback, truncation is folded into the message above: printing both
+        # claimed the profile was read in full and cut short at the same time,
+        # and the reason quoted belonged to the API attempt that had already
+        # handed over.
         err_console.print(
             f"warning — the walk stopped before exhausting the profile "
             f"({report.stop_reason or 'unknown reason'}).",

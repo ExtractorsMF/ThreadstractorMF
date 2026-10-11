@@ -57,8 +57,24 @@ def _report_scrape(report: ScrapeReport) -> None:
         f"media: {report.media}",
         f"downloaded: {report.downloaded}",
         f"skipped: {report.skipped}",
-        f"failed: {report.failed}",
     ]
+    # Only when it is non-zero: `filtered: 0` on every unfiltered run is noise,
+    # and it only explains a number the reader cannot otherwise reconcile.
+    if report.filtered:
+        parts.append(f"filtered: {report.filtered}")
+    parts.append(f"failed: {report.failed}")
+    if report.profile_pic:
+        parts.append("profile pic: 1")
+    err_console.print("summary — " + " | ".join(parts), soft_wrap=True)
+
+    # `downloaded: 0` next to a non-zero `skipped` reads as a failed run when it
+    # is the opposite: every file was already there. Say so.
+    if not report.downloaded and report.skipped:
+        err_console.print(
+            f"note — nothing was downloaded because all {report.skipped} "
+            "file(s) were already on disk.",
+            soft_wrap=True,
+        )
     if report.no_media:
         parts.append(f"without media: {report.no_media}")
     if report.reposts_skipped:
@@ -314,15 +330,21 @@ def main(
                 outcome = scraper.download_profile_pic(
                     username, final_dest, filename_template=None
                 )
-                _count(outcome, report)
+                # Not counted through _count: the avatar is not one of the
+                # posts' media, so tallying it made downloaded+skipped exceed
+                # `media` and broke the identity the summary is read by.
+                # Reported on its own line instead.
+                report.profile_pic = outcome.path is not None
                 console.print(f"  {username}_profile -> {outcome.path}", soft_wrap=True)
             except Exception:
                 pass
         for post in posts:
             for media in post.media:
                 if photos_only and media.type != "image":
+                    report.filtered += 1
                     continue
                 if videos_only and media.type != "video":
+                    report.filtered += 1
                     continue
                 if get_urls:
                     # Dry run: print the URL and move on, leaving the pacing

@@ -463,3 +463,226 @@ def test_coerce_dom_accepts_the_plain_lists_tests_stub_with():
     assert coerce_dom(["DOM"]).posts == ["DOM"]
     real = DomScrape(posts=[1], exhausted=True, reason="r")
     assert coerce_dom(real) is real
+
+
+# --- the summary must add up -------------------------------------------------
+#
+# `media` counts everything the scrape found; downloaded+skipped+failed counts
+# only what was acted on. Three things used to fall between the two with no
+# accounting at all: media excluded by --photos-only/--videos-only (skipped
+# silently), and the profile avatar (counted, though it is not a post's media,
+# which pushed the tally *above* media). A run reporting `media: 54` beside
+# `downloaded: 0 | skipped: 48` left six files apparently unaccounted for.
+
+
+def _tally(report):
+    return report.downloaded + report.skipped + report.failed + report.filtered
+
+
+def test_the_tally_accounts_for_every_media_item():
+    from threadstractormf.api import ScrapeReport
+
+    report = ScrapeReport(posts=9, media=54)
+    report.downloaded = 0
+    report.skipped = 48
+    report.filtered = 6
+    assert _tally(report) == report.media
+
+
+def test_the_profile_pic_is_not_part_of_the_media_tally():
+    """It is not a post's media, so counting it broke the identity upwards."""
+    from threadstractormf.api import ScrapeReport
+
+    report = ScrapeReport(posts=9, media=54, profile_pic=True)
+    report.skipped = 54
+    assert _tally(report) == report.media, "the avatar must not inflate the tally"
+    assert report.profile_pic is True
+
+
+def test_filtered_is_only_shown_when_it_explains_a_gap(capsys):
+    from threadstractormf.api import ScrapeReport
+    from threadstractormf.cli import _report_scrape
+
+    with_gap = ScrapeReport(posts=9, media=54)
+    with_gap.skipped = 48
+    with_gap.filtered = 6
+    _report_scrape(with_gap)
+    err = capsys.readouterr().err
+    assert "filtered: 6" in err
+    assert "profile pic" not in err
+
+    # On an unfiltered run it would be `filtered: 0` on every line: noise.
+    plain = ScrapeReport(posts=9, media=54)
+    plain.downloaded = 54
+    _report_scrape(plain)
+    err = capsys.readouterr().err
+    assert "filtered" not in err
+
+
+def test_a_run_that_only_skipped_says_so(capsys):
+    """`downloaded: 0` beside a non-zero skipped reads as failure; it is not."""
+    from threadstractormf.api import ScrapeReport
+    from threadstractormf.cli import _report_scrape
+
+    report = ScrapeReport(posts=9, media=54)
+    report.skipped = 54
+    _report_scrape(report)
+    err = capsys.readouterr().err
+
+    assert "already on disk" in err
+    assert "54" in err
+
+
+def test_a_run_that_downloaded_something_does_not_say_it(capsys):
+    from threadstractormf.api import ScrapeReport
+    from threadstractormf.cli import _report_scrape
+
+    report = ScrapeReport(posts=9, media=54)
+    report.downloaded = 54
+    _report_scrape(report)
+    err = capsys.readouterr().err
+
+    assert "already on disk" not in err, "nothing was skipped; the note would lie"
+
+
+def test_no_note_when_nothing_happened_at_all(capsys):
+    """A genuinely empty run must not claim files were already present."""
+    from threadstractormf.api import ScrapeReport
+    from threadstractormf.cli import _report_scrape
+
+    report = ScrapeReport(posts=0, media=0)
+    _report_scrape(report)
+    err = capsys.readouterr().err
+
+    assert "already on disk" not in err
+
+
+def test_the_cli_counts_filtered_media_as_it_filters_them(tmp_path, monkeypatch):
+    """End to end through the CLI, not just the summary printer.
+
+    The counter lives in the media loop; a summary-only test would still pass
+    if the loop stopped incrementing it.
+    """
+    from typer.testing import CliRunner
+
+    import threadstractormf.cli as cli_module
+    from threadstractormf.api import ScrapeReport
+    from threadstractormf.downloader import DownloadOutcome, DownloadStatus
+    from threadstractormf.models import Media, Post
+
+    posts = [
+        Post(
+            id="P1",
+            permalink="https://www.threads.com/@u/post/P1",
+            username="u",
+            media=[
+                Media(id="P1_1", post_id="P1", index=1, type="image",
+                      url="https://scontent.cdninstagram.com/a.jpg", ext="jpg"),
+                Media(id="P1_2", post_id="P1", index=2, type="video",
+                      url="https://scontent.cdninstagram.com/b.mp4", ext="mp4"),
+            ],
+        )
+    ]
+    report = ScrapeReport(posts=1, media=2)
+
+    class _FakeScraper:
+        def __init__(self, *_a, **_kw):
+            self.last_report = report
+
+        def get_posts(self, *_a, **_kw):
+            return posts
+
+        def download_profile_pic(self, *_a, **_kw):
+            raise AssertionError("not expected with --photos-only")
+
+        def download(self, media, *_a, **_kw):
+            return DownloadOutcome(
+                path=tmp_path / media.id, status=DownloadStatus.DOWNLOADED
+            )
+
+        def close(self):
+            pass
+
+    # Threadscraper is imported inside main(), so patch the class where it
+    # comes from rather than on the cli module.
+    import threadstractormf.client as client_module
+
+    monkeypatch.setattr(client_module, "Threadscraper", _FakeScraper)
+    cookies = tmp_path / "c.txt"
+    cookies.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".threads.net\tTRUE\t/\tTRUE\t2147483647\tcsrftoken\tx\n"
+    )
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["--cookies", str(cookies), "--dest", str(tmp_path / "dl"),
+         "--photos-only", "@u"],
+    )
+    assert result.exit_code == 0, result.output
+    # The video was excluded by --photos-only, so it must be accounted for.
+    assert report.filtered == 1
+    assert report.downloaded == 1
+
+
+def test_the_cli_keeps_the_avatar_out_of_the_media_tally(tmp_path, monkeypatch):
+    """Same identity, but through the CLI, so it covers the avatar path.
+
+    The previous test built the report by hand and so passed whether or not the
+    CLI still tallied the avatar — which is the thing being fixed.
+    """
+    from typer.testing import CliRunner
+
+    import threadstractormf.cli as cli_module
+    import threadstractormf.client as client_module
+    from threadstractormf.api import ScrapeReport
+    from threadstractormf.downloader import DownloadOutcome, DownloadStatus
+    from threadstractormf.models import Media, Post
+
+    posts = [
+        Post(
+            id="P1",
+            permalink="https://www.threads.com/@u/post/P1",
+            username="u",
+            media=[
+                Media(id="P1_1", post_id="P1", index=1, type="image",
+                      url="https://scontent.cdninstagram.com/a.jpg", ext="jpg")
+            ],
+        )
+    ]
+    report = ScrapeReport(posts=1, media=1)
+
+    class _FakeScraper:
+        def __init__(self, *_a, **_kw):
+            self.last_report = report
+
+        def get_posts(self, *_a, **_kw):
+            return posts
+
+        def download_profile_pic(self, *_a, **_kw):
+            return DownloadOutcome(path=tmp_path / "avatar.jpg",
+                                   status=DownloadStatus.DOWNLOADED)
+
+        def download(self, media, *_a, **_kw):
+            return DownloadOutcome(path=tmp_path / media.id,
+                                   status=DownloadStatus.SKIPPED)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(client_module, "Threadscraper", _FakeScraper)
+    cookies = tmp_path / "c.txt"
+    cookies.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".threads.net\tTRUE\t/\tTRUE\t2147483647\tcsrftoken\tx\n"
+    )
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["--cookies", str(cookies), "--dest", str(tmp_path / "dl"), "@u"],
+    )
+    assert result.exit_code == 0, result.output
+    # One media item, skipped. The avatar is fetched but must not be counted
+    # among the posts' media, or the tally reads 2 for a single item.
+    assert _tally(report) == report.media, (
+        f"tally {_tally(report)} != media {report.media}"
+    )
+    assert report.profile_pic is True

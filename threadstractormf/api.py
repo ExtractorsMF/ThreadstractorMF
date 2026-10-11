@@ -123,6 +123,14 @@ class ScrapeReport:
     downloaded: int = 0
     skipped: int = 0
     failed: int = 0
+    # Media present in the scrape but excluded by --photos-only/--videos-only.
+    # Exists so the summary can add up: `media` counts everything scraped while
+    # downloaded+skipped+failed only counts what was acted on, and the gap used
+    # to look like files silently going missing.
+    filtered: int = 0
+    # Whether the profile avatar was fetched. It is not one of the posts' media,
+    # so it is reported apart from the tally rather than inside it.
+    profile_pic: bool = False
 
 
 @dataclass

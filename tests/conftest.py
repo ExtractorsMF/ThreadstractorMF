@@ -84,6 +84,24 @@ def seed_template(api: Any, doc_id: str = "123456789", username: str = "user") -
 
 
 @pytest.fixture(autouse=True)
+def _playwright_is_assumed_available(monkeypatch):
+    """Discovery tests must not depend on the browser extra.
+
+    Every test that exercises discovery stubs ``discover_and_cache`` out, so
+    nothing needs a browser — but ``_ensure_template`` calls
+    ``_require_playwright()`` first, and that ImportError aborted the whole
+    path. Without the extra installed, six tests failed while mocking the very
+    function that would have used the browser.
+
+    Stubbed here so the suite is honest about what it needs. The one test that
+    genuinely checks the extra undoes this.
+    """
+    import threadstractormf.api as api_module
+
+    monkeypatch.setattr(api_module, "_require_playwright", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def no_sleep(monkeypatch):
     """Stop real sleeping, for every test unless one opts back in.
 

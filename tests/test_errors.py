@@ -89,7 +89,21 @@ def test_cli_reports_a_missing_file_cleanly(tmp_path):
 # --- playwright -------------------------------------------------------------
 
 
-def test_require_playwright_is_a_noop_when_installed():
+def test_require_playwright_is_a_noop_when_installed(monkeypatch):
+    """The extra being present must not be an error.
+
+    Undoes the conftest stub first — otherwise this would exercise the stub and
+    pass whether or not the extra exists, proving nothing. Skipped when it
+    really is absent: the assertion is about the installed case.
+    """
+    try:
+        import playwright.sync_api  # noqa: F401
+    except ImportError as exc:
+        # importorskip reports a module that fails *while* importing rather
+        # than skipping, so this is handled by hand.
+        pytest.skip(f"browser extra not installed: {exc}")
+
+    monkeypatch.undo()  # drop the conftest stub, get the real guard
     _require_playwright()  # must not raise; the extra is installed here
 
 

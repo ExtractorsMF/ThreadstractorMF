@@ -89,6 +89,14 @@ docker run --rm \\
 - `THREADS_USE_SANDBOX=1` is set in the `full` image so Playwright works unprivileged.
 - Multi-arch: `linux/amd64`, `linux/arm64`.
 
+## Install from PyPI
+
+```bash
+pip install threadstractormf
+pip install 'threadstractormf[browser]'
+pip install 'threadstractormf[antibot]'
+```
+
 ## Essential commands
 
 ```bash

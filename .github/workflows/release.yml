@@ -16,6 +16,9 @@ jobs:
   release:
     name: Semantic Release
     runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.out.outputs.released }}
+      tag: ${{ steps.out.outputs.tag }}
     concurrency:
       group: semantic-release
       cancel-in-progress: false
@@ -71,6 +74,13 @@ jobs:
         if: steps.out.outputs.released == 'true'
         run: uv build
 
+      - name: Upload distributions
+        if: steps.out.outputs.released == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
       - name: Attach wheel + sdist to GitHub Release
         if: steps.out.outputs.released == 'true'
         uses: softprops/action-gh-release@v2
@@ -82,10 +92,22 @@ jobs:
             dist/*.whl
             dist/*.tar.gz
 
-      # --- PyPI (enable when publishing is wanted) ---
-      # Requires: configuring "trusted publishing" at pypi.org
-      # (Projects -> Manage -> Publishing -> GitHub, workflow "release.yml").
-      #
-      # - name: Publish to PyPI
-      #   if: steps.out.outputs.released == 'true'
-      #   uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

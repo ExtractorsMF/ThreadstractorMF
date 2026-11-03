@@ -63,6 +63,32 @@ threadstractormf --version
 | downloader.py | CDN download + adoption |
 | cli.py | Typer CLI |
 
+## Docker
+
+Published to GitHub Container Registry (GHCR) on every push to `main`:
+
+```bash
+# slim (~150 MB): core only, fast GraphQL path
+docker pull ghcr.io/extractorsmf/threadstractormf:slim
+
+# full (~1 GB): slim + antibot (curl_cffi) + browser (Playwright)
+docker pull ghcr.io/extractorsmf/threadstractormf:full   # also tagged :latest
+docker pull ghcr.io/extractorsmf/threadstractormf:1.2.0
+```
+
+Run (mount cookies and destination as volumes; never bake secrets into the image):
+
+```bash
+docker run --rm \\
+  -v $(pwd)/cookies.txt:/cookies.txt:ro \\
+  -v $(pwd)/dl:/dl \\
+  ghcr.io/extractorsmf/threadstractormf:full \\
+  --cookies /cookies.txt --dest /dl @user
+```
+
+- `THREADS_USE_SANDBOX=1` is set in the `full` image so Playwright works unprivileged.
+- Multi-arch: `linux/amd64`, `linux/arm64`.
+
 ## Essential commands
 
 ```bash

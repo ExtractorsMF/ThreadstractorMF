@@ -36,11 +36,6 @@ def _api(handler, *, max_retries=5, backoff_base=2.0):
     return api, calls
 
 
-@pytest.fixture(autouse=True)
-def _no_sleep(monkeypatch):
-    monkeypatch.setattr("time.sleep", lambda *_: None)
-
-
 def _status(code, headers=None):
     return lambda _r: httpx.Response(code, json={}, headers=headers or {})
 

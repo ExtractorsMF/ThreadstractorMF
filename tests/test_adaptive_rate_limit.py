@@ -9,17 +9,13 @@ import json
 
 import httpx
 import pytest
+from conftest import seed_template
 
 import threadstractormf.rate_limit as rl
 from threadstractormf.api import _MAX_PAGES, _PAGE_SIZE, ThreadsAPI
 from threadstractormf.rate_limit import ApiRateLimiter
 
 _IMAGE = {"candidates": [{"width": 1080, "url": "https://scontent.cdninstagram.com/v/t51.1/a.jpg"}]}
-
-
-@pytest.fixture(autouse=True)
-def _no_sleep(monkeypatch):
-    monkeypatch.setattr("time.sleep", lambda *_: None)
 
 
 # --- limiter mechanics ------------------------------------------------------
@@ -137,6 +133,9 @@ def _walk(pages, limit=None):
     )
     api._resolve_user_id = lambda _u: "999"
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
+    # The doc_id is discovered and cached now, so a mocked transport has to be
+    # given one or the code under test goes looking for a real browser.
+    seed_template(api)
     return api.get_posts("user", limit=limit), calls, api
 
 
@@ -159,6 +158,9 @@ def test_429_raises_the_pacing_for_the_rest_of_the_walk():
     )
     api._resolve_user_id = lambda _u: "999"
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
+    # The doc_id is discovered and cached now, so a mocked transport has to be
+    # given one or the code under test goes looking for a real browser.
+    seed_template(api)
     posts = api.get_posts("user", limit=None)
 
     assert posts, "the crawl must still complete"
@@ -227,6 +229,9 @@ def test_posts_collected_before_a_failure_are_kept():
     )
     api._resolve_user_id = lambda _u: "999"
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
+    # The doc_id is discovered and cached now, so a mocked transport has to be
+    # given one or the code under test goes looking for a real browser.
+    seed_template(api)
     api._fetch_posts_via_playwright = lambda _u, _l: ["FALLBACK"]
 
     posts = api.get_posts("user", limit=None)
@@ -244,6 +249,9 @@ def test_falls_back_to_the_dom_scraper_when_nothing_was_collected():
     )
     api._resolve_user_id = lambda _u: "999"
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
+    # The doc_id is discovered and cached now, so a mocked transport has to be
+    # given one or the code under test goes looking for a real browser.
+    seed_template(api)
     api._fetch_posts_via_playwright = lambda _u, _l: ["FALLBACK"]
 
     assert api.get_posts("user", limit=None) == ["FALLBACK"]
@@ -268,6 +276,9 @@ def test_partial_results_respect_the_limit():
     )
     api._resolve_user_id = lambda _u: "999"
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
+    # The doc_id is discovered and cached now, so a mocked transport has to be
+    # given one or the code under test goes looking for a real browser.
+    seed_template(api)
     api._fetch_posts_via_playwright = lambda _u, _l: ["FALLBACK"]
 
     assert len(api.get_posts("user", limit=5)) == 5

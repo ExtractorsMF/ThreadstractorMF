@@ -245,6 +245,8 @@ def load_from_browser(browser: str, *, domain: str = "threads.com") -> http.cook
 
     Requires: pip install browser-cookie3
     On Linux copies the DB to /tmp to avoid database locked while the browser is open.
+    Note: browser-cookie3 may leave a temporary copy of the cookie DB in /tmp;
+    ensure /tmp is cleared on reboot or use a private temp dir.
     """
     try:
         import browser_cookie3  # type: ignore

@@ -115,7 +115,7 @@ def sanitize_filename(name: str) -> str:
     """Port of background.js:147-154 sanitizeFilename."""
     import re
 
-    s = re.sub(r"[\/\\\?\*\|<>:\"\"]", "_", name)
+    s = re.sub(r"[\/\\\?\*\|<>:\"\"\x00-\x1f\x7f]", "_", name)
     s = s.replace("..", "_")
     s = s.lstrip(".")
     s = re.sub(r"_+", "_", s)

@@ -8,10 +8,12 @@ was an empty response and a silent fall back to the much slower DOM scraper,
 with nothing shown to the user to explain why.
 """
 
+import http.cookiejar
 import json
 
 import httpx
 import pytest
+from conftest import seed_template, session_cookies
 
 import threadstractormf.rate_limit as rl
 from threadstractormf.api import ThreadsAPI, _parse_profile_html
@@ -36,9 +38,16 @@ HTML_WITHOUT_USERID = (
 )
 
 
-def _api(handler, **cfg):
-    api = ThreadsAPI({"csrftoken": "x"}, rate_limit_config=rl.RateLimitConfig(enabled=False, **cfg))
+def _api(handler, *, username="u", seed=True, cookies="session", **cfg):
+    if cookies is not None:
+        cookie_jar = session_cookies() if cookies == "session" else cookies
+    else:
+        # Sin sesion: un jar que parece anonimo (sin sessionid ni ds_user_id).
+        cookie_jar = http.cookiejar.CookieJar()
+    api = ThreadsAPI(cookie_jar, rate_limit_config=rl.RateLimitConfig(enabled=False, **cfg))
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
+    if seed:
+        seed_template(api, username=username)
     return api
 
 
@@ -170,14 +179,49 @@ def test_get_posts_falls_back_without_a_resolvable_id():
     assert api.get_posts("u", limit=5) == ["DOM"]
 
 
-def test_get_posts_does_not_call_graphql_without_a_user_id():
-    calls = {"n": 0}
+def test_anonymous_scraping_says_why_the_api_path_is_unavailable(capsys, monkeypatch, tmp_path):
+    """A profile page with no userID and no session: explain, then fall back.
 
-    def handler(request):
-        calls["n"] += 1
-        return httpx.Response(200, text=HTML_WITHOUT_USERID)
+    Threads renders the profile client-side, so an unauthenticated fetch
+    carries no ``userID`` at all, and an anonymous browser never issues the
+    media query in the first place — only fetchBarcelonaExperimentQuery. So
+    there is nothing to capture, and the captured tokens could not be replayed
+    either even if there were.
 
-    api = _api(handler)
-    api._fetch_posts_via_playwright = lambda _u, _l: []
-    api.get_posts("u", limit=5)
-    assert calls["n"] == 1, "only the profile page, no GraphQL POST"
+    What matters is that this is *said* rather than silent: the DOM path still
+    works anonymously, and the message names how to get the fast one.
+    """
+    import threadstractormf._discovery as disc
+
+    monkeypatch.setattr(disc, "_CACHE_SUBDIR", str(tmp_path / "cache"))
+
+    api = _api(lambda _r: httpx.Response(200, text=HTML_WITHOUT_USERID),
+               username="u", seed=False, cookies=None)
+    api._fetch_posts_via_playwright = lambda _u, _l: ["DOM"]
+
+    assert api.get_posts("u", limit=5) == ["DOM"]
+    assert api.last_report.used_fallback is True
+    err = capsys.readouterr().err
+    assert "no session cookies" in err
+    assert "--cookies" in err, "the message must say how to get the fast path"
+
+
+def test_get_posts_still_falls_back_when_nothing_can_resolve_the_account(
+    monkeypatch, tmp_path
+):
+    """With neither an HTML id nor a usable template, the DOM path is all
+    that is left — and it must be reached rather than raising."""
+    import threadstractormf._discovery as disc
+
+    monkeypatch.setattr(disc, "_CACHE_SUBDIR", str(tmp_path / "cache"))
+
+    api = _api(lambda _r: httpx.Response(200, text=HTML_WITHOUT_USERID), username="u", seed=False)
+    api._fetch_posts_via_playwright = lambda _u, _l: ["DOM"]
+
+    monkeypatch.setattr(
+        "threadstractormf.api.discover_and_cache",
+        lambda user, cookies: (_ for _ in ()).throw(RuntimeError("no query observed")),
+    )
+
+    assert api.get_posts("u", limit=5) == ["DOM"]
+    assert api.last_report.used_fallback is True

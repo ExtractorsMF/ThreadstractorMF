@@ -233,6 +233,21 @@ class CurlClient:
 # ─── Playwright ──────────────────────────────────────────────────────────────
 
 
+def chromium_launch_args() -> list[str]:
+    """Args for ``chromium.launch``.
+
+    ``--no-sandbox`` is required in many CI/container environments but reduces
+    isolation. It can be disabled by setting ``THREADS_USE_SANDBOX=1`` when the
+    environment supports an unprivileged sandbox.
+    """
+    import os
+
+    args = ["--disable-blink-features=AutomationControlled"]
+    if os.environ.get("THREADS_USE_SANDBOX") != "1":
+        args.insert(0, "--no-sandbox")
+    return args
+
+
 def to_playwright_cookies(jar: Any) -> list[dict[str, Any]]:
     """Convert a CookieJar into the dict shape ``BrowserContext.add_cookies`` wants.
 

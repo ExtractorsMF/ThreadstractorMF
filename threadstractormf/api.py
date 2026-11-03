@@ -1,7 +1,10 @@
 """Threads GraphQL client — implemented via Brave sniffing of threads.com.
 
 Sniff: POST https://www.threads.com/graphql/query
-  doc_id=37598244946487292 (BarcelonaProfileMediaTabRefetchableDirectQuery)
+  form-encoded; the query is a *persisted* one, so the client sends no query
+  text, only fb_api_req_friendly_name + the doc_id that indexes the server-side
+  copy. Meta rotates that id whenever the query changes, so it is captured from
+  the live web app and cached rather than hardcoded — see _discovery.py.
   variables: {"after":null,"first":11,"userID":"<userID>", ...}
   headers: X-CSRFToken, X-IG-App-ID 238260118697367, X-ASBD-ID 129477,
   Referer threads.com, lsd, jazoest
@@ -13,26 +16,43 @@ post_id mapping: post.code if present else raw pk. Media.id = post_id / post_id_
 
 from __future__ import annotations
 
-import json
 import random
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import urlparse
 
 import httpx
 
 from threadstractormf._backend import (
     CurlClient,
+    chromium_launch_args,
     is_retryable_status,
     is_transient_error,
     to_playwright_cookies,
 )
+from threadstractormf._discovery import (
+    RequestTemplate,
+    build_body,
+    clear_template,
+    discover_and_cache,
+    load_template,
+    session_fingerprint,
+)
+from threadstractormf._parsing import (
+    _guess_ext,
+    _parse_post_node,
+    _parse_profile_html,
+    _walk_xhr_videos,
+)
+
+# Re-exported for backwards compat (tests import these from here).
+from threadstractormf._parsing import _pick_best_image as _pick_best_image  # noqa: F401
+from threadstractormf._parsing import _pick_best_video as _pick_best_video  # noqa: F401
 from threadstractormf.auth import get_csrf_token, load_netscape_cookies
-from threadstractormf.models import Media, MediaType, Post, Profile, extract_post_id
+from threadstractormf.models import Media, Post, Profile, extract_post_id
 from threadstractormf.rate_limit import (
     ApiRateLimiter,
     RateLimitConfig,
@@ -40,7 +60,9 @@ from threadstractormf.rate_limit import (
     parse_retry_after,
 )
 
-_DOC_ID_MEDIA = "37598244946487292"
+# The GraphQL endpoint. The request's parameters — doc_id above all — are not
+# hardcoded here: see threadstractormf._discovery, which captures them from the
+# live web app. A hardcoded doc_id is exactly what rotted in 1.2.0.
 _GRAPHQL_URL = "https://www.threads.com/graphql/query"
 _X_IG_APP_ID = "238260118697367"
 _X_ASBD_ID = "129477"
@@ -55,6 +77,18 @@ _PAGE_SIZE = 12
 # walk is slow instead of risky. When a limit is set the budget is derived from
 # it instead (see get_posts).
 _MAX_PAGES = 200
+
+# How many times one scrape may capture a GraphQL request template: once to get
+# a starting point, once after the server rejected the one we had. Beyond that
+# the problem is not a rotated id, and retrying only hammers the endpoint.
+_MAX_TEMPLATE_ATTEMPTS = 2
+
+# How the browser fallback's scroll walk ended. The ceiling is the only exit
+# that means truncation outright; the others leave it genuinely unclear, and the
+# summary should not claim otherwise.
+_CEILING_REASON = "the scroll ceiling was reached"
+_STOP_RENDERING_REASON = "the profile stopped rendering new posts"
+_LIMIT_REASON = "the requested limit was reached"
 
 
 def _warn(message: str) -> None:
@@ -86,6 +120,12 @@ class ScrapeReport:
     truncated: bool = False
     stop_reason: str = ""
     used_fallback: bool = False
+    # Why the *browser* scraper stopped, when it is the one that produced the
+    # output. Kept apart from stop_reason because the two describe different
+    # walks: stop_reason belonged to the GraphQL attempt that already handed
+    # over, and leaving it there made the summary blame the API for a walk the
+    # browser scraper ended.
+    fallback_reason: str = ""
     api_error: str = ""
     limit: int | None = None
     # Filled in by the CLI as the media loop runs: download_media reports
@@ -93,10 +133,56 @@ class ScrapeReport:
     downloaded: int = 0
     skipped: int = 0
     failed: int = 0
+    # Media present in the scrape but excluded by --photos-only/--videos-only.
+    # Exists so the summary can add up: `media` counts everything scraped while
+    # downloaded+skipped+failed only counts what was acted on, and the gap used
+    # to look like files silently going missing.
+    filtered: int = 0
+    # Whether the profile avatar was fetched. It is not one of the posts' media,
+    # so it is reported apart from the tally rather than inside it.
+    profile_pic: bool = False
+
+
+@dataclass
+class DomScrape:
+    """What the browser scraper produced, and why it stopped.
+
+    The fallback used to hand back a bare list, so "reached the end of the
+    timeline" and "ran out of scrolls" were indistinguishable to the caller —
+    and the report carried whatever reason the failed API attempt had left
+    behind.
+    """
+
+    posts: list[Any] = field(default_factory=list)
+    # Proven only by the scroll loop ending on a break. False means the ceiling
+    # was hit, which is truncation rather than completion.
+    exhausted: bool = False
+    reason: str = ""
+
+
+def coerce_dom(value: Any) -> DomScrape:
+    """Accept either a DomScrape or the plain lists the test stubs return.
+
+    Thirty-odd tests stub the fallback with ``[]`` or ``["DOM"]``; without this
+    every one of them would break on an unrelated change.
+    """
+    if isinstance(value, DomScrape):
+        return value
+    return DomScrape(posts=list(value) if value else [])
 
 
 class _NonJsonResponse(Exception):
     """The GraphQL endpoint answered with the web app instead of JSON."""
+
+
+class _StaleTemplate(Exception):
+    """The captured request template no longer resolves; rediscover it.
+
+    Distinct from every other failure because it is *recoverable*: the cached
+    doc_id is simply out of date, and capturing a fresh one is enough. Raising
+    here rather than silently retrying keeps the recovery in one place, where it
+    can be bounded — one rediscovery per scrape, never a loop.
+    """
 
 
 def _finish_report(report: ScrapeReport, posts: list[Any]) -> None:
@@ -155,228 +241,6 @@ def _require_playwright() -> None:
         ) from exc
 
 
-def _guess_ext(url: str) -> str:
-    """Best-effort file extension from the URL *path*.
-
-    Extension is read from the path segment itself rather than by searching the
-    whole URL: an image like ".../video_cover.jpg" used to be tagged `.mp4`
-    because the path contained the word "video", which produced files whose
-    extension disagreed with their contents.
-    """
-    path = urlparse(url).path.lower()
-    last_segment = path.rsplit("/", 1)[-1]
-    suffix = last_segment.rsplit(".", 1)[-1] if "." in last_segment else ""
-    # "jpg" is kept as-is (not folded into "jpeg") so filenames stay identical
-    # to previous versions and existing archives still dedup by name.
-    if suffix in {"jpg", "jpeg", "png", "webp", "gif", "avif", "heic", "bmp"}:
-        return suffix
-    video = {"mp4", "webm", "mov", "m4v"}
-    if suffix in video:
-        return suffix
-    # No usable extension in the path: fall back to the URL as a whole, which
-    # is how Threads serves some CDN URLs.
-    low = url.lower()
-    if ".mp4" in low or ".webm" in low or ".mov" in low:
-        return "mp4" if ".mp4" in low else ("webm" if ".webm" in low else "mov")
-    return "jpg"
-
-
-def _pick_best_image(candidates: list[dict]) -> str | None:
-    if not candidates:
-        return None
-    # mayor width primero
-    try:
-        c = max(candidates, key=lambda x: int(x.get("width", 0)))
-        return c.get("url")
-    except Exception:
-        return candidates[0].get("url")
-
-
-def _pick_best_video(versions: Any) -> str | None:
-    """Best MP4 URL out of a ``video_versions`` list.
-
-    Instagram orders these ascending by bitrate, so index 0 is the *worst*
-    rendition — picking it silently threw away resolution. Prefer the entry
-    with the largest pixel area, falling back to pixel count and then to the
-    last element (the highest rung in the ladder).
-    """
-    if not isinstance(versions, list) or not versions:
-        return None
-    candidates = [v for v in versions if isinstance(v, dict) and v.get("url")]
-    if not candidates:
-        return None
-
-    def score(item: dict) -> tuple[int, int]:
-        return (int(item.get("width") or 0) * int(item.get("height") or 0),
-                int(item.get("width") or 0))
-
-    best = max(candidates, key=score)
-    if score(best)[0] == 0 and len(candidates) > 1:
-        # No dimensions reported: trust the ordering and take the top rung.
-        best = candidates[-1]
-    url = best.get("url")
-    return str(url) if url else None
-
-
-def _parse_profile_html(html: str) -> tuple[str | None, str | None, str | None]:
-    """Extract ``(user_id, lsd, profile_pic_url)`` from a profile page.
-
-    A single pass over the document, shared by ``_resolve_user_id`` and
-    ``get_profile`` so one page fetch serves both.
-
-    Only ``userID`` identifies the account. The previous fallback to ``pk``
-    matched the *first* ``pk`` in the document, which belongs to a post — the
-    same field ``_parse_post_node`` treats as a post id — and then used it as
-    the GraphQL ``userID``. That produced empty results and a silent, very slow
-    fallback to the DOM scraper, with no way to tell the user why.
-    """
-    user_id = None
-    lsd = None
-    pic = None
-
-    m = re.search(r'"userID"\s*:\s*"(\d+)"', html)
-    if m:
-        user_id = m.group(1)
-
-    m = re.search(r'"lsd"\s*:\s*"([^"]+)"', html)
-    if m:
-        lsd = m.group(1)
-
-    m = re.search(r'"profile_pic_url"\s*:\s*"((?:[^"\\]|\\.)*)"', html)
-    if m:
-        # The value is JSON-escaped inside the HTML blob. Only ``\u0026`` and
-        # ``\/`` matter for a URL, and leaving ``\/`` in place produces a URL the
-        # CDN will not serve.
-        pic = m.group(1).replace(r"\u0026", "&").replace(r"\/", "/")
-
-    return user_id, lsd, pic
-
-
-def _parse_post_node(node: dict, fallback_username: str | None = None) -> Post | None:
-    # node = {"thread_items": [{"post": {...}}]}
-    try:
-        items = node.get("thread_items") or []
-        if not items:
-            return None
-        post = items[0].get("post")
-        if not post:
-            return None
-        # reposts: if post.user.username != fallback_username and excluded, filtered above
-        pk = str(post.get("pk") or "")
-        code = post.get("code")
-        # code is the short post_id like DKxyz (threads.net/@user/post/<code>)
-        post_id = code if code else pk
-        if not post_id:
-            return None
-        username = post.get("user", {}).get("username") or fallback_username or "unknown"
-        permalink = f"https://www.threads.com/@{username}/post/{post_id}"
-        # caption
-        cap = post.get("caption", {})
-        caption = None
-        if isinstance(cap, dict):
-            caption = cap.get("text")
-        # datetime from taken_at (unix)
-        taken = post.get("taken_at")
-        datetime_iso = None
-        if taken:
-            try:
-                from datetime import datetime, timezone
-
-                datetime_iso = datetime.fromtimestamp(int(taken), tz=timezone.utc).isoformat()
-            except Exception:
-                pass
-        # counts (no vienen en mediaData, set 0)
-        like_count = 0
-        # carousel
-        medias: list[Media] = []
-        vtype: MediaType = "image"
-        carousel = post.get("carousel_media")
-        # single media case
-        if carousel and isinstance(carousel, list) and len(carousel) > 0:
-            for idx, cm in enumerate(carousel):
-                # cm has image_versions2 or video_versions
-                url = None
-                vtype = "image"
-                if cm.get("video_versions"):
-                    url = _pick_best_video(cm["video_versions"])
-                    vtype = "video"
-                if not url:
-                    iv2 = cm.get("image_versions2", {})
-                    url = _pick_best_image(iv2.get("candidates", []))
-                if not url:
-                    continue
-                ext = _guess_ext(url)
-                mid = post_id if len(carousel) == 1 else f"{post_id}_{idx+1}"
-                medias.append(
-                    Media(id=mid, post_id=post_id, index=idx + 1, type=vtype, url=url, ext=ext)
-                )
-        else:
-            # single image/video
-            url = None
-            vtype = "image"
-            if post.get("video_versions"):
-                url = _pick_best_video(post["video_versions"])
-                vtype = "video"
-            if not url:
-                iv2 = post.get("image_versions2", {})
-                url = _pick_best_image(iv2.get("candidates", []))
-            if url:
-                ext = _guess_ext(url)
-                medias.append(
-                    Media(id=post_id, post_id=post_id, index=1, type=vtype, url=url, ext=ext)
-                )
-            else:
-                # text only? skip if no media (we do not want text-only posts)
-                pass
-        # no medias: skip entirely (user asked for photos/videos only)
-        if not medias:
-            return None
-        return Post(
-            id=post_id,
-            permalink=permalink,
-            username=username,
-            caption=caption,
-            datetime_iso=datetime_iso,
-            like_count=like_count,
-            media=medias,
-        )
-    except Exception:
-        return None
-
-
-def _walk_xhr_videos(node: Any, found: dict[str, list[str]]) -> None:
-    """Recursively collect {post_code: [mp4 urls]} from threads site API JSON.
-
-    Post objects carry "code" plus video_versions at their own level or inside
-    carousel_media items; this walks arbitrary response trees.
-    """
-    if isinstance(node, dict):
-        code = node.get("code")
-        if isinstance(code, str):
-            urls: list[str] = []
-            vv = node.get("video_versions")
-            if isinstance(vv, list):
-                for v in vv:
-                    if isinstance(v, dict) and ".mp4" in (v.get("url") or ""):
-                        urls.append(str(v["url"]))
-            car = node.get("carousel_media")
-            if isinstance(car, list):
-                for item in car:
-                    if (
-                        isinstance(item, dict)
-                        and isinstance(item.get("video_versions"), list)
-                    ):
-                        for v in item["video_versions"]:
-                            if isinstance(v, dict) and ".mp4" in (v.get("url") or ""):
-                                urls.append(str(v["url"]))
-            if urls:
-                found[code].extend(urls)
-        for v in node.values():
-            _walk_xhr_videos(v, found)
-    elif isinstance(node, list):
-        for v in node:
-            _walk_xhr_videos(v, found)
-
 
 class ThreadsAPI:
     """Low-level client. Used by Threadscraper."""
@@ -396,6 +260,9 @@ class ThreadsAPI:
         self.impersonate = impersonate
         self.timeout = timeout
         self._client: Any = None
+        # True only for a client this class built. An injected one (tests, a
+        # caller supplying their own session) is never discarded or rebuilt.
+        self._owns_client = False
         self.rate_limit_config = rate_limit_config or RateLimitConfig()
         self._api_limiter = ApiRateLimiter(
             rps=self.rate_limit_config.rps, enabled=self.rate_limit_config.enabled
@@ -405,12 +272,29 @@ class ThreadsAPI:
         # scrape that does both should not pay for two requests.
         self._profile_cache: dict[str, str] = {}
         self._lsd: str | None = None
+        # Replayable GraphQL request parameters, discovered from the web app.
+        # Keyed by username: the captured variables carry the userID of the
+        # account the browser queried, which is only valid for that profile.
+        self._templates: dict[str, RequestTemplate] = {}
+        self._template: RequestTemplate | None = None
+        self._template_attempted: set[str] = set()
+        self._template_attempts = 0
+        self._fingerprint_cache: str | None = None
+        self._has_session_cache: bool | None = None
         # Counters for the most recent get_posts() call, so the CLI can report a
         # truncated scrape instead of ending in silence.
         self.last_report = ScrapeReport()
 
     def _headers(self) -> dict[str, str]:
         csrf = get_csrf_token(self.cookies) or ""
+        # The captured template carries the lsd the request was built with, and
+        # it must agree with the body's lsd: Threads pairs the two. Prefer the
+        # template's; fall back to the one parsed off the profile page.
+        lsd = ""
+        if self._template is not None:
+            lsd = self._template.params.get("lsd", "")
+        if not lsd:
+            lsd = self._lsd or ""
         h = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -422,7 +306,7 @@ class ThreadsAPI:
             "X-IG-App-ID": _X_IG_APP_ID,
             "X-ASBD-ID": _X_ASBD_ID,
             "Referer": "https://www.threads.com/",
-            "X-FB-LSD": self._lsd or "",
+            "X-FB-LSD": lsd,
             "Sec-Fetch-Site": "same-origin",
             "Sec-Fetch-Mode": "cors",
         }
@@ -436,6 +320,7 @@ class ThreadsAPI:
         """
         if self._client:
             return self._client
+        self._owns_client = True
         if self.impersonate:
             # curl_cffi takes (connect, total): the read budget must cover a
             # whole GraphQL response, so scale it off the public `timeout`.
@@ -528,6 +413,8 @@ class ThreadsAPI:
         Shared by user-id resolution and the profile lookup so that a scrape
         which does both (the CLI does) pays for a single request instead of two.
         """
+        if not username or not re.fullmatch(r"[A-Za-z0-9._]+", username):
+            return None
         cached = self._profile_cache.get(username)
         if cached is not None:
             return cached
@@ -540,6 +427,148 @@ class ThreadsAPI:
         html = str(resp.text)
         self._profile_cache[username] = html
         return html
+
+    def _has_session(self) -> bool:
+        """Whether these cookies identify a logged-in account.
+
+        Gates browser-based discovery, which can only capture what a
+        logged-in page actually issues.
+        """
+        if self._has_session_cache is None:
+            self._has_session_cache = session_fingerprint(self.cookies) != "anonymous"
+        return self._has_session_cache
+
+    def _fingerprint(self) -> str:
+        """Cache key for the current session's captured template.
+
+        Computed once: the cookies do not change over a client's life, and this
+        runs on every page of the walk.
+        """
+        if self._fingerprint_cache is None:
+            self._fingerprint_cache = session_fingerprint(self.cookies)
+        return self._fingerprint_cache
+
+    def _ensure_template(self, username: str) -> RequestTemplate | None:
+        """Return a usable request template, discovering one if needed.
+
+        Order: in-memory, then disk cache, then a browser capture.
+
+        Two separate bounds, deliberately different in scope:
+
+        * the per-profile guard stops the *same* target being re-attempted
+          within one scrape, so "the browser is missing" fails once and fast
+          instead of stalling on every page;
+        * :attr:`_template_attempts` is global, because a batch scrape across
+          many profiles must still not spend unbounded time in the browser.
+        """
+        key = username.lstrip("@").split("/")[0]
+        cached_in_memory = self._templates.get(key)
+        if cached_in_memory is not None:
+            self._template = cached_in_memory
+            return cached_in_memory
+
+        # The cache is per (session, account): the captured tokens are bound to
+        # the session that produced them, and the captured variables name the
+        # profile the browser visited.
+        fingerprint = self._fingerprint()
+        cached = load_template(fingerprint, key)
+        if cached is not None:
+            self._templates[key] = cached
+            self._template = cached
+            return cached
+
+        # Per profile, not per instance. A scraper reused across several
+        # accounts must be able to discover for each one: a capture that
+        # failed (or was skipped) for @a says nothing about @b. As a plain
+        # flag this locked discovery out after the first target, so every
+        # subsequent profile silently fell back to the DOM path.
+        if key in self._template_attempted:
+            return None
+        self._template_attempted.add(key)
+
+        # The two checks below abort without attempting anything, so they must
+        # come *before* the budget is spent. Counting them turned a batch of
+        # anonymous profiles into "the query was refused again after
+        # recapturing its id" — which never happened, there was simply no
+        # session to capture from and no browser to capture with.
+
+        # Only a logged-in browser issues the media query. Verified: an
+        # anonymous profile page fires only fetchBarcelonaExperimentQuery, so
+        # launching a browser to capture the media query provably finds
+        # nothing — about 15 wasted seconds on every anonymous scrape, for a
+        # path that then falls back to the DOM scraper anyway. The captured
+        # lsd and fb_dtsg are session-bound too, so a template captured for
+        # one account cannot be replayed by another (measured: execution
+        # error). Anonymous scraping keeps using the DOM path.
+        if not self._has_session():
+            _warn(
+                "no GraphQL template cached and no session cookies, so the query "
+                "cannot be discovered (Threads only issues it to a logged-in "
+                "browser); using the DOM scraper, which is slower but works "
+                "anonymously. Pass --cookies or --cookies-from-browser for the "
+                "fast API path."
+            )
+            return None
+
+        try:
+            _require_playwright()
+        except ImportError:
+            # Degrade cleanly: no template, no browser, so the fast path is
+            # impossible for this run. Say exactly how to enable it rather than
+            # failing with a bare ImportError later.
+            _warn(
+                "no cached GraphQL template and the browser extra is missing, so "
+                "the query parameters cannot be discovered. Install "
+                "'threadstractormf[browser]' and 'playwright install chromium' to "
+                "enable the fast API path."
+            )
+            return None
+
+        # Everything above only checks whether an attempt is possible; from
+        # here the browser really launches, so this is where the budget is
+        # spent. Global on purpose: a batch scrape must not spend unbounded
+        # time in the browser, however many profiles it visits.
+        self._template_attempts += 1
+        if self._template_attempts > _MAX_TEMPLATE_ATTEMPTS:
+            # Two captures, two rejections: something structural changed.
+            # Stop here rather than looping against Threads.
+            _warn(
+                "the GraphQL query was refused again after recapturing its id; "
+                "stopping the fast path for this run"
+            )
+            return None
+
+        try:
+            template = discover_and_cache(username, self.cookies)
+        except Exception as exc:
+            _warn(
+                f"could not capture the GraphQL request template "
+                f"({exc.__class__.__name__}: {exc}); falling back to the DOM scraper"
+            )
+            return None
+
+        self._templates[username.lstrip("@").split("/")[0]] = template
+        self._template = template
+        _warn(f"captured a current GraphQL doc_id ({template.doc_id})")
+        return template
+
+    def _invalidate_template(self) -> None:
+        """Drop the template the server just rejected.
+
+        Both the in-memory copy and the disk cache go, so the next attempt
+        rediscovers rather than replaying a doc_id known to be dead.
+
+        The per-profile guard is cleared as well: this is the server telling us
+        the id is wrong, which is a *different* situation from having no way to
+        get one, and it deserves its own capture. :attr:`_template_attempts` is
+        what stops that from looping, and it stays global on purpose — a scrape
+        must not spend unbounded time in the browser across many profiles.
+        """
+        username = self._template.username if self._template else ""
+        self._templates.pop(username, None)
+        self._template = None
+        self._template_attempted.discard(username)
+        clear_template(self._fingerprint(), username)
 
     def _resolve_user_id(self, username: str) -> str:
         if username in self._user_id_cache:
@@ -603,6 +632,8 @@ class ThreadsAPI:
             raise RuntimeError(f"get_profile failed for @{username}: {e}") from e
 
     def _fetch_profile_pic_via_playwright(self, username: str) -> str | None:
+        if not username or not re.fullmatch(r"[A-Za-z0-9._]+", username):
+            return None
         try:
             # Optional enrichment: a missing browser here is not fatal, the caller
             # just gets no avatar. Warn instead of failing silently.
@@ -616,7 +647,7 @@ class ThreadsAPI:
             with sync_playwright() as p:
                 b = p.chromium.launch(
                     headless=True,
-                    args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+                    args=chromium_launch_args(),
                 )
                 ctx = b.new_context(
                     user_agent=(
@@ -645,7 +676,13 @@ class ThreadsAPI:
         limit: int | None,
         *,
         authenticated: bool = _PROFILE_FALLBACK_AUTHENTICATED,
-    ) -> list[Post]:
+    ) -> DomScrape:
+        """Read the profile with a browser.
+
+        Returns a :class:`DomScrape` rather than a bare list so the caller can
+        tell "the timeline ended" from "we hit the scroll ceiling" — the two
+        look identical in the posts and mean the opposite thing about coverage.
+        """
         from collections import defaultdict
 
         _require_playwright()
@@ -675,7 +712,7 @@ class ThreadsAPI:
         with sync_playwright() as p:
             b = p.chromium.launch(
                     headless=True,
-                    args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+                    args=chromium_launch_args(),
                 )
             ctx = b.new_context(
                 user_agent=(
@@ -706,6 +743,13 @@ class ThreadsAPI:
             empty_rounds = 0
             prev_time_count = 0
             data: list[dict[str, Any]] = []
+            # Why the walk ended. The three exits below used to be
+            # indistinguishable: "the profile ran out", "the caller wanted less"
+            # and "we hit the ceiling" all left the caller with the same list
+            # and no explanation, so the summary ended up quoting the reason the
+            # *API* attempt had failed. The scroll ceiling is the one that
+            # actually means truncation, and it is the for/else below.
+            reason = ""
             for scroll in range(max_scrolls):
                 page.mouse.wheel(0, 4000)
                 # Per-scroll pacing is what decides whether the profile is read
@@ -731,6 +775,11 @@ class ThreadsAPI:
                 if time_count == prev_time_count:
                     empty_rounds += 1
                     if empty_rounds >= empty_rounds_limit:
+                        # The walk believes it reached the end of the timeline.
+                        # "Believes" is doing real work here: this is a heuristic
+                        # on rendering, and it is the one that once truncated 9
+                        # posts to 4 in silence.
+                        reason = _STOP_RENDERING_REASON
                         break
                     # skip the heavy extraction when nothing new rendered
                     continue
@@ -739,7 +788,11 @@ class ThreadsAPI:
                 prev_time_count = time_count
                 # check if new posts loaded
                 data = page.evaluate(r"""() => {
-                    const html = document.documentElement.innerHTML;
+                    // Limitar el HTML parseado al contenedor principal reduce el
+                    // coste de la serializacion en perfiles largos; si no existe
+                    // (versiones antiguas de la pagina), se cae a document.body.
+                    const root = document.querySelector('main, [role="main"]') || document.body;
+                    const html = root.innerHTML;
                     // valid codes: only those appearing in real /post/ links
                     // (filters false positives like "code":"en_US")
                     const validCodes = new Set();
@@ -866,9 +919,15 @@ class ThreadsAPI:
                     if limit is not None and len(posts) >= limit:
                         break
                 if limit is not None and len(posts) >= limit:
+                    reason = _LIMIT_REASON
                     break
                 # NOTE: no early break on empty rounds here — the scroll loop
                 # already stops after 3 consecutive rounds without new renders
+            else:
+                # The loop ran its full course without a break: the ceiling is
+                # the one exit that means the timeline was cut short rather
+                # than finished.
+                reason = _CEILING_REASON
             b.close()
         # merge XHR-captured videos into converted posts (late posts only exist
         # here — their media JSON is never serialized into document HTML)
@@ -900,7 +959,196 @@ class ThreadsAPI:
         if limit is not None:
             posts = posts[:limit]
         # repost filter already implicit: username == target (DOM filtered)
-        return posts
+        # `exhausted` means "we know this is everything the caller asked for",
+        # not "we read the whole profile". Only the requested limit earns that:
+        # stopping because the page stopped rendering is a heuristic, and it is
+        # the one that once returned 4 posts out of 9 in silence. The ceiling is
+        # the opposite — known truncation.
+        return DomScrape(posts=posts, exhausted=reason == _LIMIT_REASON, reason=reason)
+
+    def _walk_graphql(
+        self,
+        username: str,
+        user_id: str | None,
+        *,
+        limit: int | None,
+        exclude_reposts: bool,
+        report: ScrapeReport,
+        collected: list[Post],
+    ) -> list[Post]:
+        """Walk the profile cursor, appending into ``collected``.
+
+        ``collected`` is passed in rather than returned so that posts parsed
+        before a mid-walk failure survive the exception: a crawl that dies on
+        page 7 still has six pages of good output, and dropping them would
+        throw away work that was already paid for.
+
+        Split out of :meth:`get_posts` so the stale-template retry can re-enter
+        it from scratch with a freshly captured template, instead of resuming a
+        walk whose cursor belongs to parameters that no longer resolve.
+
+        ``userID`` is read from the captured template rather than from the
+        profile HTML: the HTML carries several ``userID`` fields and the first
+        one is the *viewer's own* account, not the profile being read — using it
+        made every GraphQL query ask for the wrong account, which Threads
+        refuses with ``execution error``. The template's variables name the
+        account the browser actually queried, which is by construction the
+        right one.
+        """
+        template = self._ensure_template(username)
+        if template is None:
+            # No template and no way to get one: the walk cannot start. Report
+            # the real reason (already warned by _ensure_template) rather than
+            # sending a request known to fail, and let the caller fall back.
+            if not report.api_error:
+                report.api_error = (
+                    "no GraphQL request template available and discovery is "
+                    "unavailable"
+                )
+            raise _NonJsonResponse(report.api_error)
+
+        # The client bakes X-FB-LSD in at construction, and the lsd it needs
+        # comes from this template — discovered *after* the first request of the
+        # process already built the client (the profile fetch runs first).
+        # Rebuilding is how the new lsd is picked up. Patching the header dict
+        # in place only worked for httpx, and CurlClient (--impersonate) has no
+        # ``headers`` at all, which raised AttributeError on the path the README
+        # recommends for the WAF.
+        #
+        # Once per walk, not per page: this used to sit inside the loop below,
+        # so a 200-page crawl paid 200 TLS handshakes for no reason.
+        #
+        # Only a client this class built is replaced. An injected one (tests, a
+        # caller supplying their own session) is left alone: discarding it would
+        # silently swap a mocked transport for a real one and send the request
+        # to the network.
+        if self._client is not None and self._owns_client:
+            self._client.close()
+            self._client = None
+
+        target_id = template.variables.get("userID") or template.user_id or user_id
+        if not target_id:
+            raise _NonJsonResponse("could not determine the target account id")
+
+        variables = {
+            "after": None,
+            "allow_page_info_for_lox_user": False,
+            "before": None,
+            "first": _PAGE_SIZE,
+            "last": None,
+            "userID": target_id,
+        }
+        out: list[Post] = []
+        seen_ids: set[str] = set()
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        # With a limit, never fetch more pages than could be needed.
+        # Reposts get filtered and posts are deduped, so a page can
+        # yield fewer than _PAGE_SIZE usable posts: leave headroom.
+        # _MAX_PAGES stays a hard ceiling so an absurd --limit cannot
+        # turn into an unbounded walk.
+        page_budget = _MAX_PAGES
+        if limit is not None:
+            page_budget = min(_MAX_PAGES, max(1, -(-limit // _PAGE_SIZE) + 2))
+        for _ in range(page_budget):
+            variables["after"] = cursor
+            body = build_body(template, variables)
+            resp = self._request_with_rate_limit("POST", template.endpoint, data=body)
+            report.pages_fetched += 1
+            # Threads answers 200 text/html (the web app shell) when the
+            # query is rejected — stale doc_id, a rotated __rev, a
+            # missing LSD. That used to raise inside resp.json(), get
+            # swallowed by the broad except below and surface only as
+            # "falling back to the DOM scraper", hiding the real cause.
+            # Decode defensively rather than trusting the content-type:
+            # a real GraphQL reply may omit the header, and what matters
+            # is whether the body parses as JSON at all.
+            try:
+                j = resp.json()
+            except ValueError as exc:
+                ctype = (resp.headers.get("content-type") or "no content-type")
+                report.api_error = (
+                    f"GraphQL returned {resp.status_code} {ctype.split(';')[0]} "
+                    f"instead of JSON ({exc.__class__.__name__}); "
+                    "stale doc_id or __rev"
+                )
+                raise _NonJsonResponse(report.api_error) from exc
+            if not (j.get("data") and j["data"].get("mediaData")):
+                # Distinguish "the server refused the query" from "the
+                # payload was merely partial". Threads answers a stale
+                # doc_id / rotated __rev with 200 JSON carrying
+                # errors: [{"severity": "CRITICAL", ...}] and no data —
+                # indistinguishable from an empty profile unless the
+                # errors field is inspected, which it never was.
+                errors = j.get("errors") or []
+                if errors:
+                    msgs = "; ".join(
+                        str(e.get("message", e))[:60]
+                        for e in errors[:2]
+                        if isinstance(e, dict)
+                    ) or "no detail"
+                    report.api_error = f"GraphQL returned errors: {msgs}"
+                    report.stop_reason = "the API rejected the query"
+                    # The cached template just proved it no longer
+                    # resolves. Throw it away and capture a fresh one
+                    # from the web app, then let the walk be retried by
+                    # the caller rather than dying on a stale id.
+                    self._invalidate_template()
+                    raise _StaleTemplate(report.api_error)
+                else:
+                    report.stop_reason = "mediaData absent"
+                break  # partial/absent payload: keep what we have
+
+            media_data = j["data"]["mediaData"]
+            for edge in media_data.get("edges", []) or []:
+                node = edge.get("node") or {}
+                post = _parse_post_node(node, fallback_username=username)
+                if not post:
+                    report.unparsed += 1
+                    continue
+                if exclude_reposts and post.username.lower() != username.lower():
+                    report.reposts_skipped += 1
+                    continue
+                # Guard against a cursor that loops back over edges we
+                # already emitted.
+                if post.id in seen_ids:
+                    continue
+                seen_ids.add(post.id)
+                out.append(post)
+                # Mirror into `collected` immediately: if the next request
+                # raises, this post is still real output and must not be lost.
+                collected.append(post)
+                if limit is not None and len(out) >= limit:
+                    break
+
+            if limit is not None and len(out) >= limit:
+                report.stop_reason = f"limit reached ({limit})"
+                break
+
+            # page_info parsing is defensive: a missing/renamed key
+            # must not turn into an infinite walk.
+            page_info = media_data.get("page_info") or {}
+            if not isinstance(page_info, dict) or not page_info.get("has_next_page"):
+                report.stop_reason = "the server reports no further pages"
+                break
+            next_cursor = page_info.get("end_cursor")
+            if not next_cursor or not isinstance(next_cursor, str):
+                report.stop_reason = "page_info carries no usable end_cursor"
+                break
+            if next_cursor in seen_cursors:
+                report.stop_reason = "the server repeated the cursor"
+                break  # server repeating the cursor -> stop
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        else:
+            report.truncated = True
+            report.stop_reason = f"page budget of {page_budget} exhausted"
+
+        if out:
+            if limit is not None:
+                out = out[:limit]
+            return out
+        return []
 
     def get_posts(
         self, username: str, *, limit: int | None = None, exclude_reposts: bool = True
@@ -917,146 +1165,67 @@ class ThreadsAPI:
             try:
                 user_id = self._resolve_user_id(username)
             except Exception as exc:
-                user_id = None
+                # Not fatal. An unauthenticated profile page carries no
+                # userID at all (Threads renders it client-side), and this
+                # guard used to send every anonymous scrape straight to the
+                # DOM path without ever trying discovery — which *can* resolve
+                # the account on its own, because the captured variables name
+                # the profile the browser actually visited.
                 report.api_error = f"userID: {exc.__class__.__name__}"
-            if user_id:
-                # GraphQL path: walk the `after` cursor until the profile is
-                # exhausted or `limit` is met. A single request only ever
-                # returns _PAGE_SIZE posts, so without this loop `--limit 50`
-                # silently truncated to one page.
-                variables = {
-                    "after": None,
-                    "allow_page_info_for_lox_user": False,
-                    "before": None,
-                    "first": _PAGE_SIZE,
-                    "last": None,
-                    "userID": user_id,
-                    "__relay_internal__pv__BarcelonaIsLoggedInrelayprovider": False,
-                }
-                out: list[Post] = []
-                seen_ids: set[str] = set()
-                cursor: str | None = None
-                seen_cursors: set[str] = set()
-                # With a limit, never fetch more pages than could be needed.
-                # Reposts get filtered and posts are deduped, so a page can
-                # yield fewer than _PAGE_SIZE usable posts: leave headroom.
-                # _MAX_PAGES stays a hard ceiling so an absurd --limit cannot
-                # turn into an unbounded walk.
-                page_budget = _MAX_PAGES
-                if limit is not None:
-                    page_budget = min(
-                        _MAX_PAGES, max(1, -(-limit // _PAGE_SIZE) + 2)
+            try:
+                out = self._walk_graphql(
+                    username,
+                    user_id,
+                    limit=limit,
+                    exclude_reposts=exclude_reposts,
+                    report=report,
+                    collected=collected,
+                )
+            except _StaleTemplate:
+                # The cached doc_id was refused. This is the whole reason
+                # the template is captured rather than hardcoded: capture a
+                # fresh one and walk again. Bounded by
+                # _MAX_TEMPLATE_ATTEMPTS — a template that fails twice is
+                # not going to fix itself.
+                _warn(
+                    "the cached GraphQL query id is no longer accepted; "
+                    "capturing the current one and retrying"
+                )
+                # Nothing was collected under the dead id, and the new walk
+                # starts from the first page, so the old list is dropped
+                # rather than merged: the ids may not even mean the same
+                # thing under a different query revision.
+                collected.clear()
+                try:
+                    out = self._walk_graphql(
+                        username,
+                        user_id,
+                        limit=limit,
+                        exclude_reposts=exclude_reposts,
+                        report=report,
+                        collected=collected,
                     )
-                for _ in range(page_budget):
-                    variables["after"] = cursor
-                    body = {
-                        "av": "0",
-                        "__user": "0",
-                        "__a": "1",
-                        "__req": "1",
-                        "dpr": "1",
-                        "__ccg": "EXCELLENT",
-                        "__rev": "1045963118",
-                        "lsd": self._lsd or "",
-                        "jazoest": "22171",
-                        "fb_api_caller_class": "RelayModern",
-                        "fb_api_req_friendly_name": (
-                            "BarcelonaProfileMediaTabRefetchableDirectQuery"
-                        ),
-                        "variables": json.dumps(variables),
-                        "server_timestamps": "true",
-                        "doc_id": _DOC_ID_MEDIA,
-                    }
-                    resp = self._request_with_rate_limit("POST", _GRAPHQL_URL, data=body)
-                    report.pages_fetched += 1
-                    # Threads answers 200 text/html (the web app shell) when the
-                    # query is rejected — stale doc_id, a rotated __rev, a
-                    # missing LSD. That used to raise inside resp.json(), get
-                    # swallowed by the broad except below and surface only as
-                    # "falling back to the DOM scraper", hiding the real cause.
-                    # Decode defensively rather than trusting the content-type:
-                    # a real GraphQL reply may omit the header, and what matters
-                    # is whether the body parses as JSON at all.
-                    try:
-                        j = resp.json()
-                    except ValueError as exc:
-                        ctype = (resp.headers.get("content-type") or "no content-type")
+                    report.api_error = ""
+                except Exception as exc:
+                    # Keep the *original* rejection as the reported cause:
+                    # "we could not rediscover a working id" is a detail of
+                    # the recovery, while "the server refused the query" is
+                    # what the user needs to read.
+                    detail = exc.__class__.__name__
+                    _warn(
+                        f"the GraphQL query is still rejected after recapture "
+                        f"({detail}); falling back"
+                    )
+                    out = []
+                    if not report.api_error:
                         report.api_error = (
-                            f"GraphQL returned {resp.status_code} {ctype.split(';')[0]} "
-                            f"instead of JSON ({exc.__class__.__name__}); "
-                            "stale doc_id or __rev"
+                            "GraphQL query rejected and no replacement "
+                            "doc_id could be captured"
                         )
-                        raise _NonJsonResponse(report.api_error) from exc
-                    if not (j.get("data") and j["data"].get("mediaData")):
-                        # Distinguish "the server refused the query" from "the
-                        # payload was merely partial". Threads answers a stale
-                        # doc_id / rotated __rev with 200 JSON carrying
-                        # errors: [{"severity": "CRITICAL", ...}] and no data —
-                        # indistinguishable from an empty profile unless the
-                        # errors field is inspected, which it never was.
-                        errors = j.get("errors") or []
-                        if errors:
-                            msgs = "; ".join(
-                                str(e.get("message", e))[:60]
-                                for e in errors[:2]
-                                if isinstance(e, dict)
-                            ) or "no detail"
-                            report.api_error = f"GraphQL returned errors: {msgs}"
-                            report.stop_reason = "the API rejected the query"
-                        else:
-                            report.stop_reason = "mediaData absent"
-                        break  # partial/absent payload: keep what we have
 
-                    media_data = j["data"]["mediaData"]
-                    for edge in media_data.get("edges", []) or []:
-                        node = edge.get("node") or {}
-                        post = _parse_post_node(node, fallback_username=username)
-                        if not post:
-                            report.unparsed += 1
-                            continue
-                        if exclude_reposts and post.username.lower() != username.lower():
-                            report.reposts_skipped += 1
-                            continue
-                        # Guard against a cursor that loops back over edges we
-                        # already emitted.
-                        if post.id in seen_ids:
-                            continue
-                        seen_ids.add(post.id)
-                        out.append(post)
-                        if limit is not None and len(out) >= limit:
-                            break
-
-                    if limit is not None and len(out) >= limit:
-                        report.stop_reason = f"limit reached ({limit})"
-                        break
-
-                    # Everything parsed so far survives a failure further down.
-                    collected = out
-
-                    # page_info parsing is defensive: a missing/renamed key
-                    # must not turn into an infinite walk.
-                    page_info = media_data.get("page_info") or {}
-                    if not isinstance(page_info, dict) or not page_info.get("has_next_page"):
-                        report.stop_reason = "the server reports no further pages"
-                        break
-                    next_cursor = page_info.get("end_cursor")
-                    if not next_cursor or not isinstance(next_cursor, str):
-                        report.stop_reason = "page_info carries no usable end_cursor"
-                        break
-                    if next_cursor in seen_cursors:
-                        report.stop_reason = "the server repeated the cursor"
-                        break  # server repeating the cursor -> stop
-                    seen_cursors.add(next_cursor)
-                    cursor = next_cursor
-                else:
-                    report.truncated = True
-                    report.stop_reason = f"page budget of {page_budget} exhausted"
-
-                if out:
-                    if limit is not None:
-                        out = out[:limit]
-                    _finish_report(report, out)
-                    return out
+            if out:
+                _finish_report(report, out)
+                return out
         except Exception as exc:
             # The cursor walk can fail several pages in. Anything already
             # collected is still valid output, so keep it and only fall back to
@@ -1073,8 +1242,17 @@ class ThreadsAPI:
             )
         # Fallback DOM robusto
         report.used_fallback = True
-        report.truncated = True  # the DOM fallback only ever sees a viewport
-        posts = self._fetch_posts_via_playwright(username, limit)
+        # Still pessimistic on purpose. The scroll walk can only say it stopped
+        # *rendering*, which is not proof the timeline ended — that heuristic
+        # once returned 4 posts out of 9 in silence. So truncated stays True and
+        # what changes is the reason: it now names the walk that produced the
+        # output instead of the API attempt that already handed over.
+        report.truncated = True
+        dom = coerce_dom(self._fetch_posts_via_playwright(username, limit))
+        posts = dom.posts
+        report.fallback_reason = dom.reason
+        if dom.reason:
+            report.stop_reason = dom.reason
         if not posts:
             # Not an exception: an empty or private profile legitimately yields
             # nothing, and that cannot be told apart from a silent failure.

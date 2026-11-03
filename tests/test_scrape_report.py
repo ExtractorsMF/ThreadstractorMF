@@ -15,6 +15,7 @@ Two halves are covered here:
 import json
 
 import httpx
+from conftest import seed_template
 
 import threadstractormf.rate_limit as rl
 from threadstractormf.api import ThreadsAPI
@@ -55,6 +56,18 @@ def _codes(n, prefix="P"):
     return [f"{prefix}{i}" for i in range(n)]
 
 
+def _seed_template(api):
+    """Give a mocked API a usable request template.
+
+    Since 1.3 the doc_id is captured from the live web app rather than
+    hardcoded, so a mocked transport has to supply one. Without this the walk
+    would reach for Playwright, which is both slow and pointless against a
+    MockTransport. Delegated to the shared helper in conftest so the shape
+    (username key, relay variables) cannot drift from the rest of the suite.
+    """
+    return seed_template(api)
+
+
 def _api(pages, *, user_id="999"):
     """A ThreadsAPI wired to a mocked GraphQL transport."""
     calls = {"n": 0}
@@ -72,6 +85,13 @@ def _api(pages, *, user_id="999"):
     api = ThreadsAPI({"csrftoken": "x"}, rate_limit_config=rl.RateLimitConfig(enabled=False))
     api._resolve_user_id = lambda _u: user_id
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
+    _seed_template(api)
+    # Stub the DOM fallback here rather than per test. These cases all end in
+    # "GraphQL produced nothing", which is exactly when get_posts reaches for
+    # the browser — unstubbed that launches Chromium and calls threads.com for
+    # ~23s, to return posts the test never looks at. Tests that care about the
+    # fallback still override this.
+    api._fetch_posts_via_playwright = lambda _u, _l: []
     api._test_calls = calls  # type: ignore[attr-defined]
     return api
 
@@ -94,6 +114,7 @@ def test_html_instead_of_json_is_reported_not_hidden():
     api = ThreadsAPI({"csrftoken": "x"}, rate_limit_config=rl.RateLimitConfig(enabled=False))
     api._resolve_user_id = lambda _u: "999"
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
+    _seed_template(api)
     api._fetch_posts_via_playwright = lambda _u, _l: []
 
     api.get_posts("user", limit=5)
@@ -113,6 +134,7 @@ def test_the_warning_reaches_stderr_not_stdout(capsys):
     api = ThreadsAPI({"csrftoken": "x"}, rate_limit_config=rl.RateLimitConfig(enabled=False))
     api._resolve_user_id = lambda _u: "999"
     api._client = httpx.Client(transport=httpx.MockTransport(handler))
+    _seed_template(api)
     api._fetch_posts_via_playwright = lambda _u, _l: []
 
     api.get_posts("user", limit=5)
@@ -369,3 +391,298 @@ def test_a_genuinely_empty_payload_is_not_reported_as_an_error():
     report = api.last_report
     assert report.api_error == ""
     assert report.stop_reason == "mediaData absent"
+
+
+# --- the fallback's summary must not contradict itself ----------------------
+#
+# A browser scrape used to print two warnings that disagreed: "it reads the
+# public profile in full" and, immediately after, "the walk stopped before
+# exhausting the profile (the API rejected the query)". Both were true of the
+# two different stages, and neither of the stage that actually produced the
+# posts.
+
+
+def _summary(report, capsys):
+    from threadstractormf.cli import _report_scrape
+
+    _report_scrape(report)
+    return capsys.readouterr().err
+
+
+def test_the_fallback_does_not_also_claim_the_walk_was_cut_short(capsys):
+    from threadstractormf.api import ScrapeReport
+
+    report = ScrapeReport(posts=9, media=54, truncated=True, used_fallback=True)
+    report.fallback_reason = "the profile stopped rendering new posts"
+    err = _summary(report, capsys)
+
+    assert "the walk stopped before exhausting" not in err, err
+    # But truncation is not hidden: it is folded into the fallback message.
+    assert "stopped because the profile stopped rendering" in err
+
+
+def test_a_truncated_api_walk_still_warns_on_its_own(capsys):
+    """The guard must not swallow the warning when no fallback was involved."""
+    from threadstractormf.api import ScrapeReport
+
+    report = ScrapeReport(posts=4, media=29, truncated=True, stop_reason="page budget")
+    err = _summary(report, capsys)
+
+    assert "the walk stopped before exhausting" in err
+    assert "page budget" in err
+
+
+def test_the_fallback_message_names_its_own_reason_not_the_apis(capsys):
+    from threadstractormf.api import ScrapeReport
+
+    report = ScrapeReport(
+        posts=9,
+        media=54,
+        truncated=True,
+        used_fallback=True,
+        api_error="GraphQL returned errors: execution error",
+        stop_reason="the API rejected the query",
+    )
+    report.fallback_reason = "the scroll ceiling was reached"
+    err = _summary(report, capsys)
+
+    # The API error survives: it is still why we left the fast path.
+    assert "the API did not respond" in err
+    assert "execution error" in err
+    # But it is not quoted as the reason the walk stopped.
+    assert "the walk stopped before exhausting" not in err
+    assert "It stopped because the scroll ceiling was reached" in err
+    assert "(the API rejected the query)" not in err
+
+
+def test_coerce_dom_accepts_the_plain_lists_tests_stub_with():
+    """Thirty-odd tests stub the fallback with a bare list; they must keep working."""
+    from threadstractormf.api import DomScrape, coerce_dom
+
+    assert coerce_dom([]).posts == []
+    assert coerce_dom(["DOM"]).posts == ["DOM"]
+    real = DomScrape(posts=[1], exhausted=True, reason="r")
+    assert coerce_dom(real) is real
+
+
+# --- the summary must add up -------------------------------------------------
+#
+# `media` counts everything the scrape found; downloaded+skipped+failed counts
+# only what was acted on. Three things used to fall between the two with no
+# accounting at all: media excluded by --photos-only/--videos-only (skipped
+# silently), and the profile avatar (counted, though it is not a post's media,
+# which pushed the tally *above* media). A run reporting `media: 54` beside
+# `downloaded: 0 | skipped: 48` left six files apparently unaccounted for.
+
+
+def _tally(report):
+    return report.downloaded + report.skipped + report.failed + report.filtered
+
+
+def test_the_tally_accounts_for_every_media_item():
+    from threadstractormf.api import ScrapeReport
+
+    report = ScrapeReport(posts=9, media=54)
+    report.downloaded = 0
+    report.skipped = 48
+    report.filtered = 6
+    assert _tally(report) == report.media
+
+
+def test_the_profile_pic_is_not_part_of_the_media_tally():
+    """It is not a post's media, so counting it broke the identity upwards."""
+    from threadstractormf.api import ScrapeReport
+
+    report = ScrapeReport(posts=9, media=54, profile_pic=True)
+    report.skipped = 54
+    assert _tally(report) == report.media, "the avatar must not inflate the tally"
+    assert report.profile_pic is True
+
+
+def test_filtered_is_only_shown_when_it_explains_a_gap(capsys):
+    from threadstractormf.api import ScrapeReport
+    from threadstractormf.cli import _report_scrape
+
+    with_gap = ScrapeReport(posts=9, media=54)
+    with_gap.skipped = 48
+    with_gap.filtered = 6
+    _report_scrape(with_gap)
+    err = capsys.readouterr().err
+    assert "filtered: 6" in err
+    assert "profile pic" not in err
+
+    # On an unfiltered run it would be `filtered: 0` on every line: noise.
+    plain = ScrapeReport(posts=9, media=54)
+    plain.downloaded = 54
+    _report_scrape(plain)
+    err = capsys.readouterr().err
+    assert "filtered" not in err
+
+
+def test_a_run_that_only_skipped_says_so(capsys):
+    """`downloaded: 0` beside a non-zero skipped reads as failure; it is not."""
+    from threadstractormf.api import ScrapeReport
+    from threadstractormf.cli import _report_scrape
+
+    report = ScrapeReport(posts=9, media=54)
+    report.skipped = 54
+    _report_scrape(report)
+    err = capsys.readouterr().err
+
+    assert "already on disk" in err
+    assert "54" in err
+
+
+def test_a_run_that_downloaded_something_does_not_say_it(capsys):
+    from threadstractormf.api import ScrapeReport
+    from threadstractormf.cli import _report_scrape
+
+    report = ScrapeReport(posts=9, media=54)
+    report.downloaded = 54
+    _report_scrape(report)
+    err = capsys.readouterr().err
+
+    assert "already on disk" not in err, "nothing was skipped; the note would lie"
+
+
+def test_no_note_when_nothing_happened_at_all(capsys):
+    """A genuinely empty run must not claim files were already present."""
+    from threadstractormf.api import ScrapeReport
+    from threadstractormf.cli import _report_scrape
+
+    report = ScrapeReport(posts=0, media=0)
+    _report_scrape(report)
+    err = capsys.readouterr().err
+
+    assert "already on disk" not in err
+
+
+def test_the_cli_counts_filtered_media_as_it_filters_them(tmp_path, monkeypatch):
+    """End to end through the CLI, not just the summary printer.
+
+    The counter lives in the media loop; a summary-only test would still pass
+    if the loop stopped incrementing it.
+    """
+    from typer.testing import CliRunner
+
+    import threadstractormf.cli as cli_module
+    from threadstractormf.api import ScrapeReport
+    from threadstractormf.downloader import DownloadOutcome, DownloadStatus
+    from threadstractormf.models import Media, Post
+
+    posts = [
+        Post(
+            id="P1",
+            permalink="https://www.threads.com/@u/post/P1",
+            username="u",
+            media=[
+                Media(id="P1_1", post_id="P1", index=1, type="image",
+                      url="https://scontent.cdninstagram.com/a.jpg", ext="jpg"),
+                Media(id="P1_2", post_id="P1", index=2, type="video",
+                      url="https://scontent.cdninstagram.com/b.mp4", ext="mp4"),
+            ],
+        )
+    ]
+    report = ScrapeReport(posts=1, media=2)
+
+    class _FakeScraper:
+        def __init__(self, *_a, **_kw):
+            self.last_report = report
+
+        def get_posts(self, *_a, **_kw):
+            return posts
+
+        def download_profile_pic(self, *_a, **_kw):
+            raise AssertionError("not expected with --photos-only")
+
+        def download(self, media, *_a, **_kw):
+            return DownloadOutcome(
+                path=tmp_path / media.id, status=DownloadStatus.DOWNLOADED
+            )
+
+        def close(self):
+            pass
+
+    # Threadscraper is imported inside main(), so patch the class where it
+    # comes from rather than on the cli module.
+    import threadstractormf.client as client_module
+
+    monkeypatch.setattr(client_module, "Threadscraper", _FakeScraper)
+    cookies = tmp_path / "c.txt"
+    cookies.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".threads.net\tTRUE\t/\tTRUE\t2147483647\tcsrftoken\tx\n"
+    )
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["--cookies", str(cookies), "--dest", str(tmp_path / "dl"),
+         "--photos-only", "@u"],
+    )
+    assert result.exit_code == 0, result.output
+    # The video was excluded by --photos-only, so it must be accounted for.
+    assert report.filtered == 1
+    assert report.downloaded == 1
+
+
+def test_the_cli_keeps_the_avatar_out_of_the_media_tally(tmp_path, monkeypatch):
+    """Same identity, but through the CLI, so it covers the avatar path.
+
+    The previous test built the report by hand and so passed whether or not the
+    CLI still tallied the avatar — which is the thing being fixed.
+    """
+    from typer.testing import CliRunner
+
+    import threadstractormf.cli as cli_module
+    import threadstractormf.client as client_module
+    from threadstractormf.api import ScrapeReport
+    from threadstractormf.downloader import DownloadOutcome, DownloadStatus
+    from threadstractormf.models import Media, Post
+
+    posts = [
+        Post(
+            id="P1",
+            permalink="https://www.threads.com/@u/post/P1",
+            username="u",
+            media=[
+                Media(id="P1_1", post_id="P1", index=1, type="image",
+                      url="https://scontent.cdninstagram.com/a.jpg", ext="jpg")
+            ],
+        )
+    ]
+    report = ScrapeReport(posts=1, media=1)
+
+    class _FakeScraper:
+        def __init__(self, *_a, **_kw):
+            self.last_report = report
+
+        def get_posts(self, *_a, **_kw):
+            return posts
+
+        def download_profile_pic(self, *_a, **_kw):
+            return DownloadOutcome(path=tmp_path / "avatar.jpg",
+                                   status=DownloadStatus.DOWNLOADED)
+
+        def download(self, media, *_a, **_kw):
+            return DownloadOutcome(path=tmp_path / media.id,
+                                   status=DownloadStatus.SKIPPED)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(client_module, "Threadscraper", _FakeScraper)
+    cookies = tmp_path / "c.txt"
+    cookies.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".threads.net\tTRUE\t/\tTRUE\t2147483647\tcsrftoken\tx\n"
+    )
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["--cookies", str(cookies), "--dest", str(tmp_path / "dl"), "@u"],
+    )
+    assert result.exit_code == 0, result.output
+    # One media item, skipped. The avatar is fetched but must not be counted
+    # among the posts' media, or the tally reads 2 for a single item.
+    assert _tally(report) == report.media, (
+        f"tally {_tally(report)} != media {report.media}"
+    )
+    assert report.profile_pic is True

@@ -1,4 +1,14 @@
+"""Pacing behaviour, asserted against the wall clock.
+
+These are the only tests that must actually wait: the whole point is that the
+limiter spaces calls out in real time. Everywhere else ``conftest.no_sleep``
+stubs sleeping out, so each of these asks for ``real_sleep`` to undo that —
+which is also what keeps the whole suite fast.
+"""
+
 import time
+
+import pytest
 
 from threadstractormf.rate_limit import (
     ApiRateLimiter,
@@ -6,6 +16,11 @@ from threadstractormf.rate_limit import (
     backoff_sleep,
     parse_retry_after,
 )
+
+
+@pytest.fixture(autouse=True)
+def _actually_wait(real_sleep):
+    """These tests measure elapsed time, so sleeping must be real."""
 
 
 def test_batch_cooldown_disabled_fast():

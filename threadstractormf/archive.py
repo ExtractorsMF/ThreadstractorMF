@@ -77,9 +77,13 @@ def migrate_legacy_ledger(dest: str | Path) -> bool:
     """
     root = Path(dest).expanduser().resolve()
     legacy = root / LEGACY_LEDGER_DIRNAME / LEDGER_FILENAME
-    if not legacy.is_file():
+    # Rechazar symlinks: un enlace plantado como dedup.jsonl podria redirigir
+    # el rename o la lectura fuera del directorio de destino.
+    if not legacy.is_file() or legacy.is_symlink():
         return False
     target = ledger_path_for(root)
+    if target.is_symlink():
+        return False
     if target.exists():
         # Both present: keep the new one and merge the old lines into it, so
         # neither set of downloads is forgotten.
@@ -193,6 +197,26 @@ def _entry_key(entry: Any) -> tuple[str, int] | None:
 # the post id recovers them instead of downloading everything again.
 
 
+_DIR_LISTING_CACHE: dict[str, tuple[float, list[Path]]] = {}
+
+
+def _cached_dir_listing(directory: Path) -> list[Path]:
+    try:
+        key = str(directory.resolve())
+        mtime = directory.stat().st_mtime
+    except OSError:
+        return []
+    cached = _DIR_LISTING_CACHE.get(key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    try:
+        entries = [p for p in directory.iterdir() if p.is_file()]
+    except OSError:
+        return []
+    _DIR_LISTING_CACHE[key] = (mtime, entries)
+    return entries
+
+
 def find_existing_for_post(dest: str | Path, post_id: str, index: int = 1) -> Path | None:
     """Find an already-downloaded file for item ``index`` of ``post_id``.
 
@@ -214,12 +238,14 @@ def find_existing_for_post(dest: str | Path, post_id: str, index: int = 1) -> Pa
 
     numbered: Path | None = None
     plain: Path | None = None
-    for candidate in sorted(directory.iterdir()):
-        if not candidate.is_file():
-            continue
+    for candidate in sorted(_cached_dir_listing(directory)):
         name = candidate.name
         position = name.find(post_id)
         if position == -1:
+            continue
+        # El post_id debe ser un identificador completo, no una subcadena de
+        # otro nombre (p. ej. "XP1.jpg" no debe adoptarse para post_id "P1").
+        if position > 0 and name[position - 1].isalnum():
             continue
         tail = name[position + len(post_id) :]
         if tail[:1] not in ("", ".", "_"):

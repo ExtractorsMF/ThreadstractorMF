@@ -59,8 +59,8 @@ def test_permanent_4xx_and_other_errors_are_not_retryable():
 
 
 def test_download_retries_then_succeeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    # backoff sleeps are patched out: we care about the loop logic, not waiting
-    monkeypatch.setattr("time.sleep", lambda *_: None)
+    # backoff sleeps are patched out suite-wide (see conftest.no_sleep): we care
+    # about the loop logic, not waiting
     media = _media()
     dest = tmp_path / "dl"
     calls = {"n": 0}

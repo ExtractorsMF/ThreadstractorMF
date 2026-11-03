@@ -14,11 +14,22 @@ build/
 # cookies / secrets
 cookies.txt
 *cookies*.txt
+# environment / secrets
+.env
+.env.*
+!.env.example
 scripts/sniff_log.json
 scripts/*_requests*.json
 # Frozen pre-refactor cookie loader, used as the oracle in
 # tests/test_cookie_loading.py. Not part of the package.
 .old_auth_for_tests.py
+# Project memory / agent instructions (local, not shipped)
+docs/
+AGENTS.md
+llms.txt
+llms-full.txt
+review.md
+
 # OS
 .DS_Store
 Thumbs.db

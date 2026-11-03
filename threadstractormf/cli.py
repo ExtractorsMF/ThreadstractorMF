@@ -57,8 +57,22 @@ def _report_scrape(report: ScrapeReport) -> None:
         f"media: {report.media}",
         f"downloaded: {report.downloaded}",
         f"skipped: {report.skipped}",
-        f"failed: {report.failed}",
     ]
+    # Only when it is non-zero: `filtered: 0` on every unfiltered run is noise,
+    # and it only explains a number the reader cannot otherwise reconcile.
+    if report.filtered:
+        parts.append(f"filtered: {report.filtered}")
+    parts.append(f"failed: {report.failed}")
+    if report.profile_pic:
+        parts.append("profile pic: 1")
+    # `downloaded: 0` next to a non-zero `skipped` reads as a failed run when it
+    # is the opposite: every file was already there. Say so.
+    if not report.downloaded and report.skipped:
+        err_console.print(
+            f"note — nothing was downloaded because all {report.skipped} "
+            "file(s) were already on disk.",
+            soft_wrap=True,
+        )
     if report.no_media:
         parts.append(f"without media: {report.no_media}")
     if report.reposts_skipped:
@@ -73,12 +87,19 @@ def _report_scrape(report: ScrapeReport) -> None:
             soft_wrap=True,
         )
     if report.used_fallback:
-        err_console.print(
+        msg = (
             "warning — the browser fallback was used: it is slower than the "
-            "API, but it reads the public profile in full.",
-            soft_wrap=True,
+            "API, but it reads the public profile in full."
         )
-    if report.truncated:
+        if report.fallback_reason:
+            msg += f" It stopped because {report.fallback_reason}."
+        err_console.print(msg, soft_wrap=True)
+    elif report.truncated:
+        # Only when the API walk is the one that delivered the posts. With the
+        # fallback, truncation is folded into the message above: printing both
+        # claimed the profile was read in full and cut short at the same time,
+        # and the reason quoted belonged to the API attempt that had already
+        # handed over.
         err_console.print(
             f"warning — the walk stopped before exhausting the profile "
             f"({report.stop_reason or 'unknown reason'}).",
@@ -172,8 +193,6 @@ def main(
     # normalize @user — supports threads.net and threads.com, URL or @handle
     import re as _re
 
-    from threadstractormf.client import Threadscraper
-
     if "threads.com" in target or "threads.net" in target:
         m = _re.search(r"/@([^/]+)", target)
         if m:
@@ -238,6 +257,50 @@ def main(
     except ImportError as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
+
+    _execute_scrape(
+        username=username,
+        cookies_arg=cookies_arg,
+        dest=dest,
+        limit=limit,
+        profile_pic_only=profile_pic_only,
+        photos_only=photos_only,
+        videos_only=videos_only,
+        impersonate=impersonate,
+        overwrite=overwrite,
+        no_rate_limit=no_rate_limit,
+        cooldown=cooldown,
+        batch_cooldown=batch_cooldown,
+        rps=rps,
+        filename_template=filename_template,
+        directory_template=directory_template,
+        archive=archive,
+        no_adopt_existing=no_adopt_existing,
+        get_urls=get_urls,
+    )
+
+
+def _execute_scrape(
+    username: str,
+    cookies_arg: Any,
+    dest: Path,
+    limit: int | None,
+    profile_pic_only: bool,
+    photos_only: bool,
+    videos_only: bool,
+    impersonate: str | None,
+    overwrite: bool,
+    no_rate_limit: bool,
+    cooldown: int,
+    batch_cooldown: int,
+    rps: float,
+    filename_template: str | None,
+    directory_template: str | None,
+    archive: bool,
+    no_adopt_existing: bool,
+    get_urls: bool,
+) -> None:
+    from threadstractormf.client import Threadscraper
 
     scraper = Threadscraper(
         cookies=cookies_arg,
@@ -307,15 +370,21 @@ def main(
                 outcome = scraper.download_profile_pic(
                     username, final_dest, filename_template=None
                 )
-                _count(outcome, report)
+                # Not counted through _count: the avatar is not one of the
+                # posts' media, so tallying it made downloaded+skipped exceed
+                # `media` and broke the identity the summary is read by.
+                # Reported on its own line instead.
+                report.profile_pic = outcome.path is not None
                 console.print(f"  {username}_profile -> {outcome.path}", soft_wrap=True)
             except Exception:
                 pass
         for post in posts:
             for media in post.media:
                 if photos_only and media.type != "image":
+                    report.filtered += 1
                     continue
                 if videos_only and media.type != "video":
+                    report.filtered += 1
                     continue
                 if get_urls:
                     # Dry run: print the URL and move on, leaving the pacing
@@ -344,10 +413,14 @@ def main(
                     # with orchestrators like scrapmf — a failed line there
                     # would be miscounted as a successful download).
                     err_console.print(f"[yellow]  {media.id} failed: {e}[/yellow]")
-        _report_scrape(report)
+        # En modo dry-run (--get-urls) no se descarga nada: imprimir el tally
+        # de descargas (downloaded=0/skipped=0) seria engañoso, asi que se omite.
+        if not get_urls:
+            _report_scrape(report)
+
+
     finally:
         scraper.close()
-
 
 if __name__ == "__main__":
     app()

@@ -65,8 +65,10 @@ def main(
     graphql_log: list[dict] = []
 
     with sync_playwright() as p:
+        from threadstractormf._backend import chromium_launch_args
+
         browser = p.chromium.launch(
-            headless=True, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+            headless=True, args=chromium_launch_args()
         )
         ctx = browser.new_context(
             user_agent=(

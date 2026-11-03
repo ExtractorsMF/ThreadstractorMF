@@ -4,4 +4,4 @@ from threadstractormf.client import Threadscraper
 from threadstractormf.models import Media, Post, Profile
 
 __all__ = ["Threadscraper", "Post", "Media", "Profile"]
-__version__ = "1.3.0"
+__version__ = "1.4.0"

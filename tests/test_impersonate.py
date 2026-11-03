@@ -136,6 +136,7 @@ def test_request_goes_through_curl():
             client.close()
     finally:
         srv.shutdown()
+        srv.server_close()
 
 
 def test_stream_bridges_iter_content_to_iter_bytes():
@@ -152,6 +153,7 @@ def test_stream_bridges_iter_content_to_iter_bytes():
             client.close()
     finally:
         srv.shutdown()
+        srv.server_close()
 
 
 # --- full download paths ----------------------------------------------------
@@ -174,6 +176,7 @@ def test_download_uses_impersonation_and_writes_complete_file(tmp_path, monkeypa
         assert not (out.with_name(out.name + ".part")).exists()
     finally:
         srv.shutdown()
+        srv.server_close()
 
 
 def test_download_without_impersonation_still_uses_httpx(tmp_path, monkeypatch):
@@ -200,3 +203,4 @@ def test_download_without_impersonation_still_uses_httpx(tmp_path, monkeypatch):
         assert created["type"] is httpx.Client
     finally:
         srv.shutdown()
+        srv.server_close()

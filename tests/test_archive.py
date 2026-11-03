@@ -259,7 +259,7 @@ def test_archive_disabled_falls_back_to_filename(tmp_path):
 
 
 def test_scraper_reuses_one_ledger_per_destination(tmp_path):
-    scraper = Threadscraper(cookies={"sessionid": "x"})
+    scraper = Threadscraper(cookies={"sessionid": "x"}, archive=True)
     try:
         a = scraper._ledger_for(tmp_path)
         b = scraper._ledger_for(tmp_path)
@@ -272,7 +272,7 @@ def test_scraper_reuses_one_ledger_per_destination(tmp_path):
 
 def test_one_ledger_per_account_not_per_subfolder(tmp_path):
     """photos/ and videos/ must share a single ledger for the same account."""
-    scraper = Threadscraper(cookies={"sessionid": "x"})
+    scraper = Threadscraper(cookies={"sessionid": "x"}, archive=True)
     try:
         root = scraper._ledger_for(tmp_path)
         assert scraper._ledger_for(tmp_path / "photos") is not root

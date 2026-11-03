@@ -80,8 +80,9 @@ class BatchCooldownLimiter(FixedCooldownLimiter):
                 time.sleep(max(0, wait))
 
     def wait(self) -> None:
+        # Solo pacing: el conteo (y el cooldown de lote) se hace tras una
+        # descarga exitosa, para no penalizar intentos fallidos.
         super().wait()
-        self.increment()
 
 
 class ApiRateLimiter:

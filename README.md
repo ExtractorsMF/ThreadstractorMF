@@ -1,372 +1,92 @@
 # threadstractormf
 
-Threads media downloader — `import threadstractormf` + CLI like `gallery-dl` / `yt-dlp`.
+Threads media downloader — Python library + CLI, gallery-dl/yt-dlp compatible cookies.
 
-- **Auth** via Netscape `cookies.txt` (`MozillaCookieJar`) — same file as `gallery-dl --cookies` / `yt-dlp --cookies`
-- **Media IDs** `post_id` (`/post/<code>`) + `_1/_2/_3` for carousels, no reposts
-- **Media** photos, videos, profile pic (`t51.2885-19`)
-- **Stack** `httpx[http2]` + `pydantic` + optional `curl_cffi` (TLS/JA4 impersonation) + `browser-cookie3` + `playwright` fallback, `uv`/`hatchling`, `requires-python >=3.10`
-- **Pagination** GraphQL walks the `after` cursor, so `--limit` is honoured beyond the first page
+## Project memory
 
-## Installation
+- Index: this README + `docs/` + `docs/memory/`.
+- Compact memory: `docs/memory/architecture.md`, `docs/memory/decisions.md`, `docs/memory/state.md`, `docs/memory/conventions.md`, `docs/memory/testing.md`.
+- Detailed docs: `docs/ARCHITECTURE.md`, `docs/DEVELOPMENT.md`, `docs/SECURITY.md`, `docs/PRIVACY.md`, `docs/GIT_WORKFLOW.md`, `docs/DECISIONS.md`.
+- LLM indexes: `llms.txt`, `llms-full.txt`.
+- Agent instructions: `AGENTS.md`.
+- Last documentation review: 2026-11-03.
+
+## Stack
+
+Python ≥ 3.10, `httpx[http2]`, `pydantic`, `typer`, `rich`. Optional: `curl_cffi` (antibot), `playwright` + `browser-cookie3` (browser).
+
+## Install
 
 ```bash
-# from source
-uv pip install -e ".[dev]"          # dev: pytest, respx, ruff, mypy
-uv pip install -e ".[antibot]"      # TLS bypass (curl_cffi)
-uv pip install -e ".[browser]"      # Playwright + browser-cookie3
-
-# pip
-pip install threadstractormf
-which threadstractormf  # ~/.local/bin/threadstractormf
+uv pip install -e ".[dev]"          # dev
+uv pip install -e ".[antibot]"      # TLS impersonation
+uv pip install -e ".[browser]"      # Playwright + cookies
 ```
 
-## Library
+## Quickstart
+
+Library:
 
 ```python
-import browser_cookie3
 from threadstractormf import Threadscraper
-
-# Brave (gallery-dl compatible)
-scraper = Threadscraper(cookies=browser_cookie3.brave(domain_name="threads.com"))
-# or Netscape file
 scraper = Threadscraper(cookies="cookies.txt")
-# or dict
-scraper = Threadscraper(cookies={"sessionid": "...", "csrftoken": "..."})
-
-posts = scraper.get_posts("user", limit=20)  # exclude_reposts=True by default
+posts = scraper.get_posts("user", limit=20)
 for post in posts:
-    for media in post.media:  # media.id = "DK123" or "DK123_1"
-        scraper.download(media, dest="./dl",
-            filename_template="{date:%Y-%m-%d}_{post_id}_{num:02d}.{extension}",
-            username=post.username, date_iso=post.datetime_iso)
-
+    for media in post.media:
+        scraper.download(media, dest="./dl", username=post.username, date_iso=post.datetime_iso)
 scraper.download_profile_pic("user", dest="./dl")
-
-# rate-limit configurable (port of threads-downloader background.js)
-scraper = Threadscraper(cookies="cookies.txt", rate_limit=True,
-                        cooldown_ms=4000, cooldown_after_100_ms=120000, rps=0.5)
 ```
 
-**Models:** `Post(id=post_id, permalink, username, caption, datetime_iso, media: list[Media])`, `Media(id, post_id, index, type, url, ext)`, `Profile(username, user_id, profile_pic_url)`.
-
-## CLI
+CLI:
 
 ```bash
-# gallery-dl compatible cookies
 threadstractormf --cookies cookies.txt --dest ./dl @user
 threadstractormf --cookies-from-browser brave --dest ./dl @user
-threadstractormf --cookies cookies.txt --cookies-from-browser brave --dest ./dl https://www.threads.com/@user/media
-
 threadstractormf --cookies cookies.txt --limit 50 --dest ./dl @user
-threadstractormf --cookies-from-browser brave --profile-pic-only --dest ./dl @user
-threadstractormf --cookies cookies.txt --impersonate chrome --dest ./dl @user  # curl_cffi
-
-# filename / directory templates (like gallery-dl, chronological by default)
-threadstractormf --cookies cookies.txt \
-  --filename-template "{date:%Y-%m-%d}_{post_id}_{num:02d}.{extension}" \
-  --directory-template "{scrapmf_root}/{category}/{username}/{subcategory}" \
-  --dest ./dl @user
-
-# no date, post_id only
-threadstractormf --cookies cookies.txt --filename-template "{post_id}_{num:02d}.{extension}" --dest ./dl @user
-
-# keep a ledger so re-runs skip what is already downloaded (opt-in)
-threadstractormf --cookies cookies.txt --archive --dest ./dl @user
-
-# dry run: print the media URLs and write nothing
 threadstractormf --cookies cookies.txt --get-urls --dest ./dl @user
-
 threadstractormf --version
 ```
 
-### Reporting
+## Modules
 
-Every run ends with a summary on **stderr** — stdout stays a strict
-"one line per downloaded file" stream, because scrapmf counts those lines to
-report progress:
+| Module | Responsibility |
+|---|---|
+| client.py | Facade, wiring, download orchestration |
+| api.py | GraphQL walk + Playwright DOM fallback |
+| _discovery.py | Capture/cache GraphQL template |
+| _backend.py | httpx/curl_cffi backends |
+| auth.py | Netscape/browser cookies |
+| models.py | Post/Media/Profile |
+| template.py | Filename/directory rendering |
+| rate_limit.py | Cooldowns + backoff |
+| archive.py | Download ledger |
+| downloader.py | CDN download + adoption |
+| cli.py | Typer CLI |
 
-```
-summary — posts: 9 | media: 54 | downloaded: 55 | skipped: 0 | failed: 0
-```
-
-`downloaded` counts files whose bytes were actually fetched; `skipped` counts
-media that was already on disk (recognised by the ledger, by the exact filename,
-or adopted under an older name). Before, both were announced identically, so a
-run that downloaded nothing looked exactly like a full one.
-
-Warnings follow when something was incomplete, each naming the cause rather than
-just failing:
-
-```
-warning — the API did not respond as expected: GraphQL returned errors: …
-warning — the browser fallback was used …
-warning — the walk stopped before exhausting the profile …
-```
-
-A partial scrape can no longer end in silence.
-
-### Output layout
-
-With the default template, an account lands like this:
-
-```
-./dl/
-├── photos/
-│   ├── 2026-04-14_DPa1b2C3d4E5_01.jpg      single photo
-│   ├── 2026-04-14_DPx9Y8z7W6V5_01.jpg      carousel → item 1 of 3
-│   ├── 2026-04-14_DPx9Y8z7W6V5_03.jpg      carousel → item 3 of 3
-│   └── 2026-04-14_DPcO2vE3rI4d_01.jpg      video poster (a JPEG)
-├── videos/
-│   ├── 2026-04-15_DPmN4oP5qR6S_01.mp4      video
-│   └── 2026-04-18_DPx9Y8z7W6V5_02.mp4      carousel → the video item
-├── profile/
-│   └── usuario_profile.jpg                 avatar (no date; it has none)
-└── .threadstractormf/
-    └── dedup.jsonl                         download ledger
-```
-
-The `{num:02d}` counts media items within a carousel. The extension reflects the
-real content (`video_cover.jpg` stays `.jpg`), and the folder comes from
-`media.type` — the two are independent, so a `.webm` video goes to `videos/`.
-
-**Splitting by type depends on the destination's name.** When `--dest` is a
-plain directory, media is sorted into `photos/`/`videos/`/`profile/`. When it is
-already one of those (or `posts/`, as `scrapmf` passes), everything stays flat:
-
-| `--dest` | images | videos | avatar |
-|---|---|---|---|
-| `./dl` | `dl/photos/` | `dl/videos/` | `dl/profile/` |
-| `./dl/posts` | `dl/posts/` | `dl/posts/` | `dl/posts/` |
-| `./dl/photos` | `dl/photos/` | `dl/photos/` | `dl/photos/` |
-
-### Download ledger (dedup)
-
-**Off by default.** Pass `--archive` to enable it. Without that flag nothing is
-written and no directory is created, so a plain download leaves no bookkeeping
-behind.
-
-Completed downloads are recorded in `<dest>/.archive/dedup.jsonl`, keyed by
-**`(post_id, index)`** rather than by filename. That matters because the filename
-embeds the date and the extension, and both can change — while the post id is
-stable for the life of the post. Changing `--filename-template`, fixing an
-extension guess, or a `{date}` that rolls over to today will **not** re-download
-an existing archive.
-
-A download is skipped when any of these hold:
-
-1. `(post_id, index)` is in the ledger;
-2. the exact destination file exists (and is then recorded);
-3. a file for the same `post_id` under a different name is on disk — this adopts
-   archives created by older versions, e.g. a `.webm` previously saved as `.jpg`.
-
-The ledger is created on first use once `--archive` is passed, so an existing
-archive keeps working unchanged and is picked up incrementally. `--overwrite`
-bypasses it entirely.
-
-Ledgers written by 1.1.0 and earlier lived in `<dest>/.threadstractormf/`. They
-are migrated to `.archive/` automatically the first time `--archive` is used, so
-upgrading does not re-download a library. If both directories exist, their
-entries are merged rather than one overwriting the other.
-
-Adoption matches on a delimiter after the id, so `DPxyz123` never adopts
-`DPxyz1234` — a different post.
-
-Note: adoption leaves files under their old name. Renaming them is a separate,
-manual step.
-
-### Options
-
-```
-target                          @username or https://www.threads.com/@user/media
--c, --cookies <path>            Netscape cookies.txt (gallery-dl compatible)
-    --cookies-from-browser <str> brave|chrome|firefox|edge (reads local DB)
--d, --dest <path>               output dir [default: ./dl]
--l, --limit <int>               posts limit
-      --profile-pic-only          only avatar
-      --photos-only               only image media (skip videos)
-      --videos-only               only video media (skip images)
-    --impersonate <str>         chrome (requires curl_cffi: pip install 'threadstractormf[antibot]')
-    --overwrite
-    --no-rate-limit             disable anti rate-limit (not recommended)
-    --cooldown <int>            ms between downloads [default: 2000]
-    --batch-cooldown <int>      ms each 100 downloads [default: 120000]
-    --rps <float>               req/s for GraphQL API [default: 0.5]
-    --filename-template <str>   e.g. "{date:%Y-%m-%d}_{post_id}_{num:02d}.{extension}"
-    --directory-template <str>  e.g. "{scrapmf_root}/{category}/{username}/{subcategory}"
---archive                   keep a download ledger in <dest>/.archive so
-                                 re-runs skip what is already on disk (opt-in)
-      --no-adopt-existing         do not adopt files on disk under an older name
-      --get-urls                  print the media URLs instead of downloading (dry run)
-      --version                   print the installed version and exit
-  ```
-
-`--cookies` and `--cookies-from-browser` are alternatives, not combined: if both
-are given the browser wins.
-
-**Template variables:** `{post_id}`, `{media_id}` (=`post_id_1`), `{date:%Y-%m-%d}`, `{date:%Y}`, `{num}`, `{num:02d}`, `{username}`, `{category}=threads`, `{subcategory}=posts|profile`, `{extension}`.
-
-## Cookies (gallery-dl compatible)
-
-Export in Brave/Chrome with **Get cookies.txt LOCALLY** while logged in at `threads.com`. File must start with `# Netscape HTTP Cookie File`, fields TAB-separated: `domain TRUE/FALSE path TRUE/FALSE expires name value`. `.threads.com TRUE` sends to subdomains/CDN.
-
-One file works for `gallery-dl`, `yt-dlp` and `threadstractormf`:
-```bash
-gallery-dl --cookies cookies.txt URL
-yt-dlp --cookies cookies.txt URL
-threadstractormf --cookies cookies.txt @user
-# or from browser (desktop only, copy DB to /tmp if locked)
-threadstractormf --cookies-from-browser brave @user
-```
-
-## Anti rate-limit / Anti-bot
-
-Port of `threads-downloader/background.js` + `gallery-dl sleep`:
-- **Downloads CDNs** `scontent.cdninstagram.com`: `cooldown 2s` + `120s each 100` + `jitter 20%` ( → `3-5s` with `4000ms` + `jitter 0.25`), single worker
-- **GraphQL** `https://www.threads.com/graphql/query`: token bucket `0.5 rps` + `429 Retry-After` + exponential backoff `base 2.0` (like `gallery-dl --sleep 3-6 --sleep-request 8-15 --sleep-429 120`). The request's parameters — `doc_id` above all — are **captured from the live web app and cached**, not hardcoded; see below.
-
-Meta WAF checks JA3/JA4 TLS + HTTP/2 SETTINGS + `X-CSRFToken`/`X-ASBD-ID`/`X-IG-App-ID`. If `403` with `httpx`, install `curl_cffi` and use `--impersonate chrome` (byte-for-byte Chrome, same mechanism as `yt-dlp --impersonate`). Accepted targets: `chrome`, `chrome131`, `firefox`, `safari`, `edge`, `tor` and other pinned fingerprints; an unknown name fails immediately with the list of valid ones.
-
-Impersonation covers **both** the GraphQL calls and the CDN downloads — a WAF that blocks the API also blocks the media fetches, so impersonating only half the traffic would not help.
-
-Retries only ever happen for genuinely transient failures: `429`, `5xx`, DNS/timeout/TLS resets. A permanent `403`/`404` is reported immediately instead of sitting through ~60s of backoff first.
-
-### The GraphQL query id is discovered, not hardcoded
-
-The profile-media query is a **persisted query**: the client sends no query
-text, only `fb_api_req_friendly_name` plus the `doc_id` that indexes the
-server-side copy. When Meta edits the query it registers a **new** `doc_id` and
-the old one stops resolving — the endpoint answers
-
-    {"errors": [{"message": "execution error", "severity": "CRITICAL"}]}
-
-which says nothing about what went wrong. A hardcoded constant cannot survive
-that: until 1.3.0 this project shipped `doc_id 37598244946487292`, it went
-stale, and **every** scrape silently fell through to the slow, truncating DOM
-fallback.
-
-The id is a server-side index, so it cannot be derived or guessed. The only
-source of truth is the request the web app itself issues, so on the first scrape
-that needs one the request is captured, replayed, and cached under
-`~/.cache/threadstractormf/` — keyed by session *and* account, because the
-captured tokens and the captured `variables.userID` belong to one of them. Every
-later scrape is plain GraphQL again (measured on `@zuck`: **19.3s cold → 6.7s
-warm**).
-
-When the cached id is refused, it is thrown away and recaptured, once per scrape.
-That makes a rotation self-healing: no release, no edit, no downtime. If it
-still fails, or if the browser extra is missing, the run degrades to the DOM path
-with an actionable warning on stderr.
-
-Two details measured against the live endpoint, both of which made every replay
-fail while this was being written: the captured `variables` carry ~38
-`__relay_internal__pv__Barcelona*` feature flags that Threads validates and
-refuses the query without, and the `userID` must come from the capture rather
-than from the profile HTML — the first `userID` in that document is the
-*viewer's own* account, not the profile being read.
-
-### Fallback: the browser path, and why it runs anonymously
-
-Without GraphQL, posts are read from the profile page with Playwright.
-
-That fallback deliberately runs **without the session cookies**. Measured on a
-9-post profile: an authenticated context returns **4** posts, an anonymous one
-returns **all 9**. Threads serves a logged-in client a truncated profile view
-whose own tab query answers `has_next_page=false` after four posts, while the
-anonymous view carries the whole timeline.
-
-The leading dot on cookie domains is still preserved everywhere it matters — it
-is what makes `threads.net` session cookies reach `www.threads.net` for
-downloads and API calls. Only the profile page view is anonymous, so the two
-behaviours coexist instead of one undoing the other.
-
-The scroll walk waits `3000ms` per step (jittered for the first few) and gives
-up only after 5 consecutive rounds with nothing new rendered.
-
-### Anonymous scraping cannot use the GraphQL path
-
-It is not worth trying, and the code says so instead of trying anyway.
-
-Measured: an anonymous profile page issues only
-`fetchBarcelonaExperimentQuery` — the media query never appears, so there is
-nothing for discovery to capture. And a template captured for one account
-cannot be replayed by another either: the captured `lsd` and `fb_dtsg` are
-bound to the session that produced them, which returns `execution error`.
-
-So when there is no session cookie the run skips discovery outright (a warning
-on stderr says why) and goes straight to the DOM scraper, which does work
-anonymously. That is what recovered the ~15s a naive "just try it" cost on
-every anonymous scrape.
-
-Consequence: `--cookies` or `--cookies-from-browser` is what unlocks the fast
-API path. Without one, the DOM path is the path.
-
-## scrapmf Integration
-
-`gallery-dl` has no Threads support — `scrapmf` routes Threads URLs to `threadstractormf` provider.
-
-`~/.config/scrapmf/sites/threads.toml` (auto-generated, `0o600`):
-```toml
-site = "threads"
-pattern = "threads.com"
-patterns = ["threads.com", "threads.net"]
-cookies_from_browser = "brave"
-filename_template = "{date:%Y-%m-%d}_{post_id}_{num:02d}.{extension}" # chronological, editable
-directory_template = ["{scrapmf_root}", "{category}", "{username}", "{subcategory}"]
-[rate_limit]
-sleep = "3-6"
-sleep_request = "8-15"
-sleep_429 = 120
-# Output: ~/scrapmf/<profile>/threads/<username>/posts/2026-04-14_EJEMPLO12345_01.jpg
-```
-
-Profile (`~/.config/scrapmf/profiles/<name>.toml`):
-```toml
-[[accounts.threads]]
-username = "username"
-# inherits cookies_from_browser brave; override per account if needed
-```
-
-Usage:
-```bash
-scrapmf scrape https://www.threads.com/@username/media
-scrapmf scrape --cookies-from-browser brave https://www.threads.com/@user
-# reorder filename like gallery-dl
-# edit sites/threads.toml: filename_template = "{post_id}_{num:02d}.{extension}"
-```
-
-Archive is deferred — `threads` currently dedups by filename (deterministic `{date}_{post_id}`), not JSONL.
-
-## Layout
-
-```
-threadstractormf/
-  _backend.py     # httpx | curl_cffi backend, shared retry policy, pw cookies
-  _discovery.py   # captures + caches the GraphQL request template (doc_id, lsd, variables)
-  auth.py         # MozillaCookieJar + load_from_browser("brave")
-  models.py       # Post/Media/Profile (pydantic)
-  template.py     # {date:%Y-%m-%d}_{post_id}_{num:02d} renderer
-  rate_limit.py   # BatchCooldownLimiter + ApiRateLimiter + backoff
-  api.py          # GraphQL cursor walk (discovered template) + Playwright DOM fallback
-    archive.py      # DownloadLedger: .archive/dedup.jsonl + legacy migration
-    downloader.py   # is_valid_media_url + download with rate-limit + template
-    client.py       # Threadscraper facade
-    cli.py          # Typer CLI
-  scripts/sniff.py  # Playwright capture of graphql (dev)
-  ```
-
-## Testing
+## Essential commands
 
 ```bash
-pytest -q  # auth, models, rate limiting (fixed + adaptive), retry policy,
-           # cookie loading, discovery/replay, directory safety
+uv run pytest -q
+uv run ruff check .
+uv run mypy threadstractormf scripts
 ```
 
-The suite is hermetic: `conftest.py` stubs out `time.sleep` and the network, so
-it finishes in seconds and never depends on Threads being up. Tests that measure
-real pacing (`test_rate_limit.py`) opt back in.
-           # across both backends, GraphQL pagination, --impersonate, download
-           # ledger and adoption, extension/quality extraction, user-id
-           # resolution, subfolder layout, error messages
-mypy threadstractormf scripts  # type check (also runs in CI)
-```
+## Key constraints
+
+- Ledger opt-in (`--archive`); keyed by `(post_id, index)`.
+- Browser fallback runs anonymously.
+- GraphQL doc_id is discovered, not hardcoded.
+- stdout = one line per downloaded file; diagnostics on stderr.
+- Do not commit secrets or personal identities.
+
+## More details
+
+- Usage/CLI details: `docs/DEVELOPMENT.md` (commands), `docs/ARCHITECTURE.md` (flow).
+- Security/privacy: `docs/SECURITY.md`, `docs/PRIVACY.md`.
+- Git/commits: `docs/GIT_WORKFLOW.md`.
+- Decisions: `docs/DECISIONS.md`.
+- Known issues/state: `docs/memory/state.md`.
+
+## Status
+
+408 tests pass; ruff and mypy clean. Known gaps: duplicate summary line, library `archive` default, relay flag override, profile-pic ext derivation. See `docs/memory/state.md`.

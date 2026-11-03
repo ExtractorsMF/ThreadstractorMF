@@ -264,8 +264,16 @@ def save_template(
     path = _cache_path(fingerprint, username or template.username)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.parent.chmod(0o700)
+        except OSError:
+            pass
         tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(template.to_dict(), indent=2), encoding="utf-8")
+        # Crear el temporal con modo 0600 desde el inicio, evitando la ventana
+        # en la que existiría con la umask por defecto.
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(template.to_dict(), indent=2))
         try:
             tmp.chmod(0o600)
         except OSError:
@@ -293,6 +301,10 @@ def _prune_old_templates(keep: Path) -> None:
             continue
         try:
             if not entry.is_file():
+                continue
+            # Solo se podan archivos de caché de esta herramienta; cualquier
+            # otro archivo del directorio se preserva.
+            if not entry.name.startswith("request_template.json"):
                 continue
             if entry.stat().st_mtime > cutoff:
                 continue
@@ -358,7 +370,7 @@ def discover(username: str, cookies: Any) -> RequestTemplate:
     """
     from playwright.sync_api import sync_playwright
 
-    from threadstractormf._backend import to_playwright_cookies
+    from threadstractormf._backend import chromium_launch_args, to_playwright_cookies
 
     captured: list[dict[str, str]] = []
     url = f"https://www.threads.com/@{username}/media"
@@ -366,7 +378,7 @@ def discover(username: str, cookies: Any) -> RequestTemplate:
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            args=chromium_launch_args(),
         )
         try:
             context = browser.new_context(user_agent=_UA)

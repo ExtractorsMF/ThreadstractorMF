@@ -57,6 +57,17 @@ _default_limiter = BatchCooldownLimiter(
 # taken as "the caller decided where things go", so no further split happens.
 CONTENT_DIRS = frozenset({"photos", "videos", "profile", "posts"})
 
+# Browser-like headers: video endpoints (/v/t65.*) reject python-httpx UA with 403.
+CDN_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.threads.net/",
+}
+
 
 def _split_subfolder(media: Media, dest: Path) -> str | None:
     """Subdirectory for this media, or None to write straight into ``dest``.
@@ -253,19 +264,8 @@ def download_media(
         use_limiter.wait()
 
     close_client = False
-    # Browser-like headers: video endpoints (/v/t65.*) reject python-httpx UA with 403
-    cdn_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.threads.net/",
-    }
-
     if client is None:
-        client = _build_download_client(impersonate=impersonate, headers=cdn_headers)
+        client = _build_download_client(impersonate=impersonate, headers=CDN_HEADERS)
         close_client = True
 
     # Retry loop for transient network errors; writes go to a .part temp file
@@ -278,12 +278,15 @@ def download_media(
     try:
         for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
             try:
-                with client.stream("GET", media.url, headers=cdn_headers) as r:
+                with client.stream("GET", media.url, headers=CDN_HEADERS) as r:
                     r.raise_for_status()
                     with tmp.open("wb") as f:
                         for chunk in r.iter_bytes(chunk_size=8192):
                             f.write(chunk)
                 tmp.replace(out)
+                # El cooldown de lote se cuenta solo tras una descarga exitosa.
+                if hasattr(use_limiter, "increment"):
+                    use_limiter.increment()
                 if ledger is not None:
                     ledger.record(media.post_id, media.index, out)
                 return DownloadOutcome(out, DownloadStatus.DOWNLOADED)
@@ -323,15 +326,12 @@ def download_profile_pic(
     adopt_existing: bool = True,
 ) -> DownloadOutcome:
     """Download profile pic with id f"{username}_profile"."""
+    # Derivar la extension con el mismo criterio que el resto del scraper,
+    # para que Media.ext y el archivo escrito coincidan.
+    from threadstractormf._parsing import _guess_ext
     from threadstractormf.models import Media
 
-    # derive extension
-    ext = "jpg"
-    low = url.lower()
-    if ".png" in low:
-        ext = "png"
-    elif ".webp" in low:
-        ext = "webp"
+    ext = _guess_ext(url)
     media = Media(
         id=f"{sanitize_filename(username)}_profile",
         post_id=f"{sanitize_filename(username)}_profile",

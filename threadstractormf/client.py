@@ -54,7 +54,7 @@ class Threadscraper:
         cooldown_ms: int = 2000,
         cooldown_after_100_ms: int = 120000,
         rps: float = 0.5,
-        archive: bool = True,
+        archive: bool = False,
     ):
         if isinstance(cookies, (str, Path)):
             cookies = load_netscape_cookies(cookies)
@@ -67,6 +67,7 @@ class Threadscraper:
         # a different filename template never re-downloads an existing archive.
         self.archive = archive
         self._ledgers: dict[str, DownloadLedger] = {}
+        self._download_client: Any = None
         from threadstractormf.rate_limit import BatchCooldownLimiter, RateLimitConfig
 
         self.rate_limit = rate_limit
@@ -100,6 +101,16 @@ class Threadscraper:
         """Counters for the most recent get_posts() call."""
         return self.api.last_report
 
+    def _get_download_client(self) -> Any:
+        """Cliente de descarga reutilizable (lazy)."""
+        if self._download_client is None:
+            from threadstractormf.downloader import CDN_HEADERS, _build_download_client
+
+            self._download_client = _build_download_client(
+                impersonate=self.impersonate, headers=CDN_HEADERS
+            )
+        return self._download_client
+
     # --- download ---
     def download(
         self,
@@ -115,6 +126,7 @@ class Threadscraper:
         return download_media(
             media,
             dest,
+            client=self._get_download_client(),
             overwrite=overwrite,
             impersonate=self.impersonate,
             limiter=self.download_limiter,
@@ -185,6 +197,7 @@ class Threadscraper:
             profile.profile_pic_url,
             username,
             dest,
+            client=self._get_download_client(),
             impersonate=self.impersonate,
             limiter=self.download_limiter,
             rate_limit=self.rate_limit,
@@ -193,6 +206,12 @@ class Threadscraper:
         )
 
     def close(self) -> None:
+        if self._download_client is not None:
+            try:
+                self._download_client.close()
+            except Exception:
+                pass
+            self._download_client = None
         self.api.close()
 
     def __enter__(self) -> Threadscraper:

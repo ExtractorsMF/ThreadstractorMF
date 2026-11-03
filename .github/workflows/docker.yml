@@ -39,7 +39,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/threadstractormf
+          images: ghcr.io/extractorsmf/threadstractormf
           tags: |
             type=raw,value=${{ matrix.variant }}
             type=raw,value=latest,enable=${{ matrix.variant == 'full' }}
@@ -62,4 +62,4 @@ jobs:
       - name: Smoke test (slim)
         if: matrix.variant == 'slim'
         run: |
-          docker run --rm ghcr.io/${{ github.repository_owner }}/threadstractormf:slim --version
+          docker run --rm ghcr.io/extractorsmf/threadstractormf:slim --version

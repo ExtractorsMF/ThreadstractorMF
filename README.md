@@ -8,7 +8,7 @@ Threads media downloader — Python library + CLI, gallery-dl/yt-dlp compatible 
 - Compact memory: `docs/memory/architecture.md`, `docs/memory/decisions.md`, `docs/memory/state.md`, `docs/memory/conventions.md`, `docs/memory/testing.md`.
 - Detailed docs: `docs/ARCHITECTURE.md`, `docs/DEVELOPMENT.md`, `docs/SECURITY.md`, `docs/PRIVACY.md`, `docs/GIT_WORKFLOW.md`, `docs/DECISIONS.md`.
 - LLM indexes: `llms.txt`, `llms-full.txt`.
-- Agent instructions: `AGENTS.md`.
+- Agent instructions: `../AGENTS.md` (workspace root).
 - Last documentation review: 2026-11-03.
 
 ## Stack
